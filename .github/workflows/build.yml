@@ -1,8 +1,10 @@
 name: PR Build
 
 on:
+  push:
+    branches: [ main ]
   pull_request:
-    branches: [ main ]  # Adjust to your default branch
+    branches: [ main ]
 
 jobs:
   build:
