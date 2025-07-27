@@ -36,7 +36,9 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <stdlib.h>
 #include <math.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 #ifdef max
 #undef max

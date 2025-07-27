@@ -1,0 +1,62 @@
+name: PR Build
+
+on:
+  pull_request:
+    branches: [ main ]  # Adjust to your default branch
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu
+            arch: x64
+            runner: ubuntu-latest
+          - os: ubuntu
+            arch: arm64
+            runner: ubuntu-latest
+          - os: windows
+            arch: x64
+            runner: windows-latest
+          - os: windows
+            arch: arm64
+            runner: windows-latest
+          - os: macos
+            arch: x64
+            runner: macos-latest
+          - os: macos
+            arch: arm64
+            runner: macos-latest
+
+    steps:
+    - name: Checkout source
+      uses: actions/checkout@v3
+
+    - name: Set up CMake
+      uses: jwlawson/actions-setup-cmake@v1.12
+
+    - name: Configure CMake
+      run: >
+        cmake -B build -DCMAKE_BUILD_TYPE=Release
+        ${{ matrix.os == 'windows' && matrix.arch == 'arm64' && '-A ARM64' || '' }}
+        ${{ matrix.os == 'windows' && matrix.arch == 'x64' && '-A x64' || '' }}
+        ${{ matrix.os != 'windows' && matrix.arch == 'arm64' && '-DCMAKE_OSX_ARCHITECTURES=arm64' || '' }}
+
+    - name: Build
+      run: cmake --build build --config Release
+
+    - name: Package binary
+      run: |
+        mkdir output
+        cp build/moresampler2 output/  # adjust if needed
+        cd output
+        zip moresampler2-${{ matrix.os }}-${{ matrix.arch }}.zip moresampler2
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: moresampler2-${{ matrix.os }}-${{ matrix.arch }}
+        path: output/moresampler2-${{ matrix.os }}-${{ matrix.arch }}.zip
