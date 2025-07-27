@@ -607,7 +607,15 @@ int resample(resampler_data* data) {
   // Calculate total output frames to match data->length (ms)
   int total_frames = (int)round((data->length / 1000.0) * fs / nhop);
   if (total_frames < consonant_frames) total_frames = consonant_frames + 1;
-  float f0_array[total_frames];
+  float* f0_array = malloc(sizeof(float) * total_frames);
+  if (!f0_array) {
+    // Handle out-of-memory error
+    free(f0_curve);
+    if (chunk) llsm_delete_chunk(chunk);
+    if (opt_a) llsm_delete_aoptions(opt_a);
+    if (opt_s) llsm_delete_soptions(opt_s);
+    return 1;
+  }
   convert_cents_to_hz_offset(f0_curve, pit_len, total_frames, nhop, fs, f0_array);
   llsm_container* conf_new = llsm_copy_container(chunk -> conf);
   llsm_container_attach(conf_new, LLSM_CONF_NFRM,
