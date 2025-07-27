@@ -21,6 +21,7 @@ target_link_libraries(moresampler2 PRIVATE
     ciglet
     pyin
     gvps
+    m
 )
 
 # Let main program see all library headers
@@ -29,5 +30,5 @@ target_include_directories(moresampler2 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/ciglet
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/libpyin
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/libgvps
-    m
+    
 )
