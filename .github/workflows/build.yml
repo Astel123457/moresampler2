@@ -50,18 +50,23 @@ jobs:
     - name: Build
       run: cmake --build build --config Release
 
-    - name: Package binary
+    - name: Package binary (Windows)
+      if: matrix.os == 'windows'
+      shell: pwsh
       run: |
         mkdir output
-        if [ "${{ matrix.os }}" = "windows" ]; then
-          cp build/moresampler2.exe output/
-          cd output
-          zip moresampler2-${{ matrix.os }}-${{ matrix.arch }}.zip moresampler2.exe
-        else
-          cp build/moresampler2 output/
-          cd output
-          zip moresampler2-${{ matrix.os }}-${{ matrix.arch }}.zip moresampler2
-        fi
+        Copy-Item build\moresampler2.exe output\
+        cd output
+        Compress-Archive -Path moresampler2.exe -DestinationPath moresampler2-${{ matrix.os }}-${{ matrix.arch }}.zip
+
+    - name: Package binary (Non-Windows)
+      if: matrix.os != 'windows'
+      shell: bash
+      run: |
+        mkdir output
+        cp build/moresampler2 output/
+        cd output
+        zip moresampler2-${{ matrix.os }}-${{ matrix.arch }}.zip moresampler2
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
