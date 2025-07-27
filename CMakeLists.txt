@@ -21,8 +21,10 @@ target_link_libraries(moresampler2 PRIVATE
     ciglet
     pyin
     gvps
-    m
 )
+if(NOT WIN32)
+  target_link_libraries(moresampler2 m)
+endif()
 
 # Let main program see all library headers
 target_include_directories(moresampler2 PRIVATE
