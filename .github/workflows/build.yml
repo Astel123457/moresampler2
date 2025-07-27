@@ -58,7 +58,7 @@ jobs:
         zip moresampler2-${{ matrix.os }}-${{ matrix.arch }}.zip moresampler2
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: moresampler2-${{ matrix.os }}-${{ matrix.arch }}
         path: output/moresampler2-${{ matrix.os }}-${{ matrix.arch }}.zip
