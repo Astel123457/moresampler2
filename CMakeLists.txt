@@ -15,15 +15,23 @@ add_subdirectory(libs/libllsm)
 # Main program
 add_executable(moresampler2 moresampler2.c)
 
-# Link against all the libraries
+if (WIN32)
+  # Link against all the libraries
 target_link_libraries(moresampler2 PRIVATE
     llsm
     ciglet
     pyin
     gvps
 )
+endif()
 if(NOT WIN32)
-  target_link_libraries(moresampler2 m)
+  target_link_libraries(moresampler2 PRIVATE
+    llsm
+    ciglet
+    pyin
+    gvps
+    m  # For math functions on Unix-like systems
+  ) 
 endif()
 
 # Let main program see all library headers
