@@ -55,7 +55,7 @@ jobs:
       shell: pwsh
       run: |
         mkdir output
-        Copy-Item build\moresampler2.exe output\
+        Copy-Item build\Release\moresampler2.exe output\
         cd output
         Compress-Archive -Path moresampler2.exe -DestinationPath moresampler2-${{ matrix.os }}-${{ matrix.arch }}.zip
 
