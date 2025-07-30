@@ -8,7 +8,7 @@
 #include <libllsm/llsm.h>
 #include <libpyin/pyin.h>
 
-const char* version = "0.2.0";
+const char* version = "0.2.1";
 
 // circular interpolation of two radian values
 static FP_TYPE linterpc(FP_TYPE a, FP_TYPE b, FP_TYPE ratio) {
@@ -440,42 +440,138 @@ void convert_cents_to_hz_offset(double* cents, int cents_len,
     }
 }
 
+void apply_velocity(llsm_chunk* chunk, float velocity, int* consonant_frames) {
+    int consonant_frames_old = *consonant_frames;
+    int total_frames = *(int*)llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
+    int consonant_frames_new = (int)(consonant_frames_old * velocity + 0.5f);
+    *consonant_frames = consonant_frames_new; // update caller with new length
 
-// As a note, while experimenting i thought that this was the volume of the whole frame, not the vocal tract
-// so this basically edits the tension of the vocal tract, not the volume of the whole frame
-void llsm_normalize_volume(llsm_chunk* chunk, FP_TYPE target_peak) {
-    int* total_frames = llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
-    FP_TYPE global_peak = 0.0f;
+    // Create temporary chunk to hold resampled consonant frames
+    llsm_chunk* chunk_new = llsm_create_chunk(chunk->conf, consonant_frames_new);
 
-    // Step 1: Find the global peak magnitude (linear)
-    for (int i = 0; i < *total_frames; ++i) {
-        FP_TYPE* vt_magn = llsm_container_get(chunk->frames[i], LLSM_FRAME_VTMAGN);
-        if (!vt_magn) continue;
+    // Resample consonant region using interpolation
+    for (int i = 0; i < consonant_frames_new; i++) {
+        FP_TYPE mapped = (FP_TYPE)i * consonant_frames_old / consonant_frames_new;
+        int base = (int)mapped;
+        FP_TYPE ratio = mapped - base;
 
-        int nspec = llsm_fparray_length(vt_magn);
-        for (int j = 0; j < nspec; ++j) {
-            if (vt_magn[j] > global_peak)
-                global_peak = vt_magn[j];
+        int residx = base + rand() % 5 - 2;
+        residx = max(0, min(consonant_frames_old - 1, residx));
+        base = min(base, consonant_frames_old - 2);
+
+        chunk_new->frames[i] = llsm_copy_container(chunk->frames[base]);
+        interp_llsm_frame(chunk_new->frames[i], chunk->frames[base + 1], ratio);
+
+        FP_TYPE* resvec = llsm_container_get(chunk->frames[residx], LLSM_FRAME_PSDRES);
+        if (resvec != NULL) {
+            llsm_container_attach(chunk_new->frames[i], LLSM_FRAME_PSDRES,
+                                  llsm_copy_fparray(resvec), llsm_delete_fparray, llsm_copy_fparray);
         }
     }
 
-    // Step 2: Avoid divide-by-zero
-    if (global_peak < 1e-9f || target_peak <= 0.0f)
-        return;
+    // Copy new consonant region back into original chunk
+    for (int i = 0; i < consonant_frames_new; i++) {
+        chunk->frames[i] = chunk_new->frames[i];  // transfer ownership
+    }
 
-    // Step 3: Compute gain in dB
-    FP_TYPE linear_gain = target_peak / global_peak;
-    FP_TYPE gain_db = 20.0f * log10(linear_gain);
+    // Append vowel frames aligned from original
+    int vowel_frames_old = total_frames - consonant_frames_old;
+    int vowel_frames_new = total_frames - consonant_frames_new;
 
-    // Step 4: Apply dB gain to all magnitudes
-    for (int i = 0; i < *total_frames; ++i) {
-        FP_TYPE* vt_magn = llsm_container_get(chunk->frames[i], LLSM_FRAME_VTMAGN);
-        if (!vt_magn) continue;
+    for (int i = 0; i < vowel_frames_new; i++) {
+        int old_idx = consonant_frames_old + (int)(i * ((float)vowel_frames_old / vowel_frames_new));
+        if (old_idx >= total_frames) old_idx = total_frames - 1;
 
-        int nspec = llsm_fparray_length(vt_magn);
-        for (int j = 0; j < nspec; ++j) {
-            vt_magn[j] += gain_db;
+        chunk->frames[consonant_frames_new + i] = llsm_copy_container(chunk->frames[old_idx]);
+    }
+
+    // Invalidate unused tail frames if any
+    for (int i = consonant_frames_new + vowel_frames_new; i < total_frames; i++) {
+        if (chunk->frames[i]) {
+            llsm_delete_container(chunk->frames[i]);
+            chunk->frames[i] = llsm_create_frame(0, 0, 0, 0); // empty frame
         }
+    }
+
+    llsm_delete_chunk(chunk_new);
+}
+
+// As a note, while experimenting i thought that this was the volume of the whole frame, not the vocal tract
+// so this basically edits the tension of the vocal tract, not the volume of the whole frame
+void apply_tension(llsm_chunk* chunk, FP_TYPE target_peak) {
+  int* total_frames = llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
+  FP_TYPE gain = target_peak / 50.0f;  // 50 = no change, 100 = 2x, 0 = mute
+
+  for (int i = 0; i < *total_frames; ++i) {
+      FP_TYPE* vt_magn = llsm_container_get(chunk->frames[i], LLSM_FRAME_VTMAGN);
+      if (!vt_magn) continue;
+  
+      int nspec = llsm_fparray_length(vt_magn);
+      for (int j = 0; j < nspec; ++j) {
+          vt_magn[j] *= gain;
+      }
+  }
+  return;
+}
+
+/*void apply_gender(llsm_chunk* chunk, int gender) {
+  int* total_frames = llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
+  for (int i = 0; i < *total_frames; ++i) {
+      llsm_hmframe* hm = llsm_container_get(chunk->frames[i], LLSM_FRAME_HM);
+      if (!hm) continue;
+
+      int nspec = llsm_fparray_length(hm);
+      for (int j = 0; j < nspec; ++j) {
+          hm[j] *= (gender == 1) ? 1.1f : 0.9f;
+      }
+  }
+  return;
+}*/
+
+
+typedef struct {
+    int Mt;
+    int t;
+    int g;
+    int e; // this flag is unused, kept as an example
+} Flags;
+
+int clamp(int val, int min, int max) {
+    return val < min ? min : (val > max ? max : val);
+}
+
+void parse_flag_string(const char* str, Flags* flags_out) {
+    int i = 0;
+    flags_out->Mt = 0; // default values
+    flags_out->t = 0;
+    flags_out->g = 0;
+    flags_out->e = 0; // default to false
+
+    while (str[i] != '\0') {
+        if (strncmp(&str[i], "Mt", 2) == 0) {
+            i += 2;
+            flags_out->Mt = strtol(&str[i], (char**)&str, 10); // str gets advanced
+            flags_out->Mt = clamp(flags_out->Mt, -100, 100);
+            flags_out->Mt = (flags_out->Mt + 100) / 2; // normalize to 0-100 range
+            continue;
+        } else if (str[i] == 't') {
+            i++;
+            flags_out->t = strtol(&str[i], (char**)&str, 10);
+            flags_out->t = clamp(flags_out->t, -1200, 1200);
+            continue;
+        } else if (str[i] == 'g') {
+            i++;
+            flags_out->g = strtol(&str[i], (char**)&str, 10);
+            flags_out->g = clamp(flags_out->g, -100, 100); // example clamp
+            continue;
+        } else if (str[i] == 'e') {
+            i++;
+            flags_out->e = 1; // toggle flag
+            continue;
+        }
+
+        // Skip unknown characters to avoid infinite loop
+        i++;
     }
 }
 
@@ -504,7 +600,7 @@ typedef struct {
     char* input;  // Path to the input audio file
     char* output; // Path to the output audio file
     float tone; // Musical pitch of the note to be resampled, in hertz
-    int velocity; // velocity of the consontant area
+    float velocity; // velocity of the consontant area
     char* flags; // raw string of resampler flags
     float offset; // offset in milliseconds
     float length; // length of the note in milliseconds
@@ -523,12 +619,15 @@ int resample(resampler_data* data) {
   int pit_len = getF0Contour(data->pitch_curve, f0_curve);
   if (!pit_len) { free(f0_curve); return 1; }
 
+  float velocity = (float)exp2(1 - data->velocity / 100.0f);
+  Flags flags;
+  parse_flag_string(data->flags, &flags);
+
   // Build expected .llsm2 path from input WAV path
-  char llsm_path[1024];
+  char llsm_path[256];
   snprintf(llsm_path, sizeof(llsm_path), "%s", data->input);
   char* ext = strrchr(llsm_path, '.');
   if (ext) strcpy(ext, ".llsm2");  // Replace extension
-
   // Check for existing .llsm2 (ignore .llsm)
   FILE* llsm_file = fopen(llsm_path, "rb");
 
@@ -607,6 +706,7 @@ int resample(resampler_data* data) {
   // Calculate total output frames to match data->length (ms)
   int total_frames = (int)round((data->length / 1000.0) * fs / nhop);
   if (total_frames < consonant_frames) total_frames = consonant_frames + 1;
+  
   float* f0_array = malloc(sizeof(float) * total_frames);
   if (!f0_array) {
     // Handle out-of-memory error
@@ -616,13 +716,18 @@ int resample(resampler_data* data) {
     if (opt_s) llsm_delete_soptions(opt_s);
     return 1;
   }
+  
   convert_cents_to_hz_offset(f0_curve, pit_len, total_frames, nhop, fs, f0_array);
+  for (int i = 0; i < total_frames; ++i) {
+    f0_array[i] *= pow(2.0f, (double)flags.t/120);
+  }
   llsm_container* conf_new = llsm_copy_container(chunk -> conf);
   llsm_container_attach(conf_new, LLSM_CONF_NFRM,
     llsm_create_int(total_frames), llsm_delete_int, llsm_copy_int);
-  llsm_chunk* chunk_new = llsm_create_chunk(conf_new, total_frames);
+  llsm_chunk* chunk_new = llsm_create_chunk(conf_new, 1);
   llsm_delete_container(conf_new);
   int no_stretch = 0;
+  
   // Copy consonant area directly
   if (total_frames <= sample_frames) {
     for (int i = 0; i < total_frames; i++) {
@@ -636,18 +741,30 @@ int resample(resampler_data* data) {
   }
   llsm_chunk_tolayer1(chunk_new, 2048);
   llsm_chunk_phasepropagate(chunk_new, -1);
+  if (data->velocity != 100.0f){
+    apply_velocity(chunk_new, velocity, &consonant_frames);
+  }
+  // recalculate if we need to stretch the vowel area
+  int vowel_sample_frames = sample_frames - consonant_frames;
+  int vowel_total_frames  = total_frames - consonant_frames;
+
+  if (vowel_sample_frames <= 0 || vowel_total_frames <= 0 || vowel_sample_frames >= vowel_total_frames) {
+    no_stretch = 1;
+} else {
+    no_stretch = 0;
+}
   // Loop the vowel area instead of stretching
   if (no_stretch == 0) {
     // Only stretch the vowel area (after consonant_frames)
-    int vowel_sample_frames = sample_frames - consonant_frames;
-    int vowel_total_frames = total_frames - consonant_frames;
     for (int i = consonant_frames; i < total_frames; i++) {
+      printf("Stretching vowel frame %d\n", i);
       // Map output frame i to input frame in the vowel area
       FP_TYPE mapped = (FP_TYPE)(i - consonant_frames) * vowel_sample_frames / vowel_total_frames;
       int base = consonant_frames + (int)mapped;
       FP_TYPE ratio = mapped - (int)mapped;
       int residx = base + rand() % 5 - 2;
       residx = max(consonant_frames, min(consonant_frames + vowel_sample_frames - 1, residx));
+      printf("residx: %d, base: %d, ratio: %f\n", residx, base, ratio);
       base = min(base, consonant_frames + vowel_sample_frames - 2);
       chunk_new->frames[i] = llsm_copy_container(chunk_new->frames[base]);
       interp_llsm_frame(
@@ -660,7 +777,7 @@ int resample(resampler_data* data) {
       }
     }
   }
-  
+  FP_TYPE shift = (FP_TYPE)pow(2.0f, (double)flags.t / 120.0f);
   // Set all f0 to target tone
   for(int i = 0; i < total_frames; i ++) {
     llsm_container_attach(chunk_new->frames[i], LLSM_FRAME_HM, NULL, NULL, NULL);
@@ -671,6 +788,8 @@ int resample(resampler_data* data) {
     }
     else {
       f0_i[0] = data->tone * (1.0 + f0_array[i]);
+      f0_i[0] *= shift; // apply pitch shift
+      if (f0_i[0] < 20.0f) f0_i[0] = 20.0f; // minimum F0
     }
     // Compensate for the amplitude gain.
     FP_TYPE* vt_magn = llsm_container_get(chunk_new->frames[i],
@@ -682,7 +801,8 @@ int resample(resampler_data* data) {
     }
     
   }
-  llsm_normalize_volume(chunk_new, 20.00f);
+
+  apply_tension(chunk_new, flags.Mt); // apply tension based on Mt flag
   llsm_chunk_phasepropagate(chunk_new, 1);
   llsm_chunk_tolayer0(chunk_new);
   printf("Synthesis\n");
@@ -696,7 +816,7 @@ int resample(resampler_data* data) {
 
   normalize_waveform(out->y, out->ny, 0.60f);
 
-  float scale = data->velocity / 100.0f;
+  float scale = data->volume / 100.0f;
   for (int i = 0; i < out->ny; ++i)
     out->y[i] *= scale;
 
@@ -726,7 +846,7 @@ int main(int argc, char* argv[]) {
         data.input = argv[1];
         data.output = argv[2];
         data.tone = note_to_frequency(argv[3]); // note is passed as a string (A4), so we need to convert it
-        data.velocity = atoi(argv[4]);
+        data.velocity = atof(argv[4]);
         data.flags = argv[5]; // flags are passed as a string, e.g. "Mt50"
         data.offset = atof(argv[6]);
         data.length = atof(argv[7]);
