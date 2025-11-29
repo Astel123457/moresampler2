@@ -74,8 +74,8 @@ jobs:
     - name: Upload to GitHub Release
       uses: softprops/action-gh-release@v1
       with:
-        tag_name: auto-${{ github.run_id }}  # creates a unique tag
-        name: Auto Build ${{ github.run_id }}
+        tag_name: build 0.2.2  
+        name: build 0.2.2
         draft: false
         prerelease: true
         files: output/moresampler2-${{ matrix.os }}-${{ matrix.arch }}.zip
