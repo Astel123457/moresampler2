@@ -8,7 +8,7 @@
 #include <libllsm/llsm.h>
 #include <libpyin/pyin.h>
 
-const char* version = "0.2.1";
+const char* version = "0.2.2";
 
 // circular interpolation of two radian values
 static FP_TYPE linterpc(FP_TYPE a, FP_TYPE b, FP_TYPE ratio) {
@@ -440,16 +440,19 @@ void convert_cents_to_hz_offset(double* cents, int cents_len,
     }
 }
 
-void apply_velocity(llsm_chunk* chunk, float velocity, int* consonant_frames) {
+void apply_velocity(llsm_chunk* chunk, float velocity, int* consonant_frames, int total_frames) {
     int consonant_frames_old = *consonant_frames;
-    int total_frames = *(int*)llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
     int consonant_frames_new = (int)(consonant_frames_old * velocity + 0.5f);
-    *consonant_frames = consonant_frames_new; // update caller with new length
 
-    // Create temporary chunk to hold resampled consonant frames
-    llsm_chunk* chunk_new = llsm_create_chunk(chunk->conf, consonant_frames_new);
+    // clamp a bit just in case
+    if (consonant_frames_new < 1) consonant_frames_new = 1;
+    if (consonant_frames_new > total_frames - 1) consonant_frames_new = total_frames - 1;
 
-    // Resample consonant region using interpolation
+    *consonant_frames = consonant_frames_new;
+
+    // temp chunk with resampled consonants
+    llsm_chunk* tmp = llsm_create_chunk(chunk->conf, consonant_frames_new);
+
     for (int i = 0; i < consonant_frames_new; i++) {
         FP_TYPE mapped = (FP_TYPE)i * consonant_frames_old / consonant_frames_new;
         int base = (int)mapped;
@@ -459,61 +462,112 @@ void apply_velocity(llsm_chunk* chunk, float velocity, int* consonant_frames) {
         residx = max(0, min(consonant_frames_old - 1, residx));
         base = min(base, consonant_frames_old - 2);
 
-        chunk_new->frames[i] = llsm_copy_container(chunk->frames[base]);
-        interp_llsm_frame(chunk_new->frames[i], chunk->frames[base + 1], ratio);
+        tmp->frames[i] = llsm_copy_container(chunk->frames[base]);
+        interp_llsm_frame(tmp->frames[i], chunk->frames[base + 1], ratio);
 
         FP_TYPE* resvec = llsm_container_get(chunk->frames[residx], LLSM_FRAME_PSDRES);
         if (resvec != NULL) {
-            llsm_container_attach(chunk_new->frames[i], LLSM_FRAME_PSDRES,
-                                  llsm_copy_fparray(resvec), llsm_delete_fparray, llsm_copy_fparray);
+            llsm_container_attach(tmp->frames[i], LLSM_FRAME_PSDRES,
+                                  llsm_copy_fparray(resvec),
+                                  llsm_delete_fparray, llsm_copy_fparray);
         }
     }
 
-    // Copy new consonant region back into original chunk
+    // copy temp consonants back into chunk (deep copy)
     for (int i = 0; i < consonant_frames_new; i++) {
-        chunk->frames[i] = chunk_new->frames[i];  // transfer ownership
+        if (chunk->frames[i])
+            llsm_delete_container(chunk->frames[i]);
+        chunk->frames[i] = llsm_copy_container(tmp->frames[i]);
     }
 
-    // Append vowel frames aligned from original
+    // append vowel frames from original chunk
     int vowel_frames_old = total_frames - consonant_frames_old;
     int vowel_frames_new = total_frames - consonant_frames_new;
 
     for (int i = 0; i < vowel_frames_new; i++) {
-        int old_idx = consonant_frames_old + (int)(i * ((float)vowel_frames_old / vowel_frames_new));
+        int dst_idx = consonant_frames_new + i;
+        int old_idx = consonant_frames_old +
+                      (int)(i * ((float)vowel_frames_old / vowel_frames_new));
         if (old_idx >= total_frames) old_idx = total_frames - 1;
-
-        chunk->frames[consonant_frames_new + i] = llsm_copy_container(chunk->frames[old_idx]);
+    
+        // take source pointer *before* we touch dst
+        llsm_container* src = chunk->frames[old_idx];
+        llsm_container* new_frame = llsm_copy_container(src);
+    
+        if (chunk->frames[dst_idx])
+            llsm_delete_container(chunk->frames[dst_idx]);
+    
+        chunk->frames[dst_idx] = new_frame;
     }
 
-    // Invalidate unused tail frames if any
+    // clean tail frames
     for (int i = consonant_frames_new + vowel_frames_new; i < total_frames; i++) {
         if (chunk->frames[i]) {
             llsm_delete_container(chunk->frames[i]);
-            chunk->frames[i] = llsm_create_frame(0, 0, 0, 0); // empty frame
+            chunk->frames[i] = llsm_create_frame(0, 0, 0, 0);
         }
     }
 
-    llsm_delete_chunk(chunk_new);
+    llsm_delete_chunk(tmp);
 }
 
-// As a note, while experimenting i thought that this was the volume of the whole frame, not the vocal tract
-// so this basically edits the tension of the vocal tract, not the volume of the whole frame
-void apply_tension(llsm_chunk* chunk, FP_TYPE target_peak) {
-  int* total_frames = llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
-  FP_TYPE gain = target_peak / 50.0f;  // 50 = no change, 100 = 2x, 0 = mute
+// according to my research on the tension parameter in Synthesizer V,
+// as tension increases, the higher harmonics are amplified
+// and as tension decreases, they are attenuated.
+void apply_tension(llsm_chunk* chunk, FP_TYPE tension) {
+    int* nfrm_p = llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
+    if (!nfrm_p) return;
 
-  for (int i = 0; i < *total_frames; ++i) {
-      FP_TYPE* vt_magn = llsm_container_get(chunk->frames[i], LLSM_FRAME_VTMAGN);
-      if (!vt_magn) continue;
-  
-      int nspec = llsm_fparray_length(vt_magn);
-      for (int j = 0; j < nspec; ++j) {
-          vt_magn[j] *= gain;
-      }
-  }
-  return;
+    // Map [-100,100] -> [-1,1]
+    const FP_TYPE t = tension / (FP_TYPE)100.0;
+
+    // Global strength of spectral tilt in dB (±)
+    const FP_TYPE slope_db = (FP_TYPE)32.0 * t;   // try 14–20 to taste
+
+    // Shape params: pivot ~ where tilt crosses 0; alpha controls knee sharpness
+    const FP_TYPE pivot = (FP_TYPE)0.25;          // 0..1 (slightly below mid so mids participate)
+    const FP_TYPE alpha = (FP_TYPE)2.6;           // 1.6–2.8 soft→hard knee
+    const FP_TYPE eps   = (FP_TYPE)1e-12;
+
+    for (int i = 0; i < *nfrm_p; ++i) {
+        llsm_hmframe* hm = llsm_container_get(chunk->frames[i], LLSM_FRAME_HM);
+        if (!hm || !hm->ampl || hm->nhar <= 0) continue;
+
+        // optional: measure pre-tilt energy to normalize later
+        FP_TYPE sum0 = 0;
+        for (int j = 0; j < hm->nhar; ++j) sum0 += hm->ampl[j];
+
+        for (int j = 0; j < hm->nhar; ++j) {
+            // 0..1 index low→high, eased so top doesn’t dominate
+            FP_TYPE w = (hm->nhar > 1) ? (FP_TYPE)j / (FP_TYPE)(hm->nhar - 1) : 0;
+            FP_TYPE w_eased = (FP_TYPE)0.5 - (FP_TYPE)0.5 * (FP_TYPE)cos(M_PI * w); // cosine ease
+
+            // Soft pivoted tilt in dB
+            FP_TYPE h = (FP_TYPE)tanh(alpha * (w_eased - pivot));   // ~[-1,1] with soft knee
+            FP_TYPE g_db = slope_db * h;                             // positive: boost highs, cut lows
+            FP_TYPE a = hm->ampl[j];
+            FP_TYPE adb = (FP_TYPE)20.0 * (FP_TYPE)log10(a + eps);
+            adb += g_db;
+            FP_TYPE anew = (FP_TYPE)pow((FP_TYPE)10.0, adb / (FP_TYPE)20.0);
+
+            if (anew > 1.0) anew = 1.0;
+            if (anew < 0.0) anew = 0.0;
+            hm->ampl[j] = anew;
+        }
+
+        // Optional energy preservation keeps loudness comparable and reveals spectral shape
+        // Comment this block out if you WANT overall loudness to change with tension.
+        FP_TYPE sum1 = 0;
+        for (int j = 0; j < hm->nhar; ++j) sum1 += hm->ampl[j];
+        if (sum0 > 0 && sum1 > 0) {
+            FP_TYPE k = sum0 / sum1;                 // rescale to original total linear amplitude
+            for (int j = 0; j < hm->nhar; ++j) {
+                FP_TYPE v = hm->ampl[j] * k;
+                hm->ampl[j] = v > 1.0 ? 1.0 : v;
+            }
+        }
+    }
 }
-
 /*void apply_gender(llsm_chunk* chunk, int gender) {
   int* total_frames = llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
   for (int i = 0; i < *total_frames; ++i) {
@@ -552,7 +606,7 @@ void parse_flag_string(const char* str, Flags* flags_out) {
             i += 2;
             flags_out->Mt = strtol(&str[i], (char**)&str, 10); // str gets advanced
             flags_out->Mt = clamp(flags_out->Mt, -100, 100);
-            flags_out->Mt = (flags_out->Mt + 100) / 2; // normalize to 0-100 range
+            
             continue;
         } else if (str[i] == 't') {
             i++;
@@ -741,8 +795,9 @@ int resample(resampler_data* data) {
   }
   llsm_chunk_tolayer1(chunk_new, 2048);
   llsm_chunk_phasepropagate(chunk_new, -1);
+  printf("nfrm: %d\n", total_frames);
   if (data->velocity != 100.0f){
-    apply_velocity(chunk_new, velocity, &consonant_frames);
+    apply_velocity(chunk_new, velocity, &consonant_frames, sample_frames); 
   }
   // recalculate if we need to stretch the vowel area
   int vowel_sample_frames = sample_frames - consonant_frames;
@@ -757,14 +812,12 @@ int resample(resampler_data* data) {
   if (no_stretch == 0) {
     // Only stretch the vowel area (after consonant_frames)
     for (int i = consonant_frames; i < total_frames; i++) {
-      printf("Stretching vowel frame %d\n", i);
       // Map output frame i to input frame in the vowel area
       FP_TYPE mapped = (FP_TYPE)(i - consonant_frames) * vowel_sample_frames / vowel_total_frames;
       int base = consonant_frames + (int)mapped;
       FP_TYPE ratio = mapped - (int)mapped;
       int residx = base + rand() % 5 - 2;
       residx = max(consonant_frames, min(consonant_frames + vowel_sample_frames - 1, residx));
-      printf("residx: %d, base: %d, ratio: %f\n", residx, base, ratio);
       base = min(base, consonant_frames + vowel_sample_frames - 2);
       chunk_new->frames[i] = llsm_copy_container(chunk_new->frames[base]);
       interp_llsm_frame(
@@ -802,9 +855,10 @@ int resample(resampler_data* data) {
     
   }
 
-  apply_tension(chunk_new, flags.Mt); // apply tension based on Mt flag
+  
   llsm_chunk_phasepropagate(chunk_new, 1);
   llsm_chunk_tolayer0(chunk_new);
+  apply_tension(chunk_new, flags.Mt); // apply tension based on Mt flag
   printf("Synthesis\n");
   
   llsm_output* out = llsm_synthesize(opt_s, chunk_new);
@@ -819,8 +873,9 @@ int resample(resampler_data* data) {
   float scale = data->volume / 100.0f;
   for (int i = 0; i < out->ny; ++i)
     out->y[i] *= scale;
-
+  
   wavwrite(out->y, out->ny, fs, nbit, data->output);
+  
 
   llsm_delete_output(out);
   llsm_delete_chunk(chunk);
