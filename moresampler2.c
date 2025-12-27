@@ -8,7 +8,7 @@
 #include <libllsm/llsm.h>
 #include <libpyin/pyin.h>
 
-const char* version = "0.2.2";
+const char* version = "0.2.3";
 
 // circular interpolation of two radian values
 static FP_TYPE linterpc(FP_TYPE a, FP_TYPE b, FP_TYPE ratio) {
@@ -442,34 +442,49 @@ void convert_cents_to_hz_offset(double* cents, int cents_len,
 
 void apply_velocity(llsm_chunk* chunk, float velocity, int* consonant_frames, int total_frames) {
     int consonant_frames_old = *consonant_frames;
-    int consonant_frames_new = (int)(consonant_frames_old * velocity + 0.5f);
+
+    if (total_frames <= consonant_frames_old + 1) {
+        printf("main_resampler: error applying velocity, no velocity applied.\n");
+        return;
+    }
+        
+    int consonant_frames_new =
+        (int)(consonant_frames_old * velocity + 0.5f);
 
     // clamp a bit just in case
-    if (consonant_frames_new < 1) consonant_frames_new = 1;
-    if (consonant_frames_new > total_frames - 1) consonant_frames_new = total_frames - 1;
+    if (consonant_frames_new < 1) {
+        consonant_frames_new = 1;
+    }
+    if (consonant_frames_new > total_frames - 1) {
+      consonant_frames_new = total_frames - 1;
+    }
 
     *consonant_frames = consonant_frames_new;
 
     // temp chunk with resampled consonants
     llsm_chunk* tmp = llsm_create_chunk(chunk->conf, consonant_frames_new);
 
+    
     for (int i = 0; i < consonant_frames_new; i++) {
-        FP_TYPE mapped = (FP_TYPE)i * consonant_frames_old / consonant_frames_new;
+        FP_TYPE mapped =
+            (FP_TYPE)i * consonant_frames_old / consonant_frames_new;
         int base = (int)mapped;
         FP_TYPE ratio = mapped - base;
 
         int residx = base + rand() % 5 - 2;
         residx = max(0, min(consonant_frames_old - 1, residx));
-        base = min(base, consonant_frames_old - 2);
+        base   = min(base, consonant_frames_old - 2);
 
         tmp->frames[i] = llsm_copy_container(chunk->frames[base]);
         interp_llsm_frame(tmp->frames[i], chunk->frames[base + 1], ratio);
 
-        FP_TYPE* resvec = llsm_container_get(chunk->frames[residx], LLSM_FRAME_PSDRES);
+        FP_TYPE* resvec =
+            llsm_container_get(chunk->frames[residx], LLSM_FRAME_PSDRES);
         if (resvec != NULL) {
             llsm_container_attach(tmp->frames[i], LLSM_FRAME_PSDRES,
                                   llsm_copy_fparray(resvec),
-                                  llsm_delete_fparray, llsm_copy_fparray);
+                                  llsm_delete_fparray,
+                                  llsm_copy_fparray);
         }
     }
 
@@ -480,28 +495,31 @@ void apply_velocity(llsm_chunk* chunk, float velocity, int* consonant_frames, in
         chunk->frames[i] = llsm_copy_container(tmp->frames[i]);
     }
 
-    // append vowel frames from original chunk
+    // --- vowel region inside the *sample* ---
     int vowel_frames_old = total_frames - consonant_frames_old;
     int vowel_frames_new = total_frames - consonant_frames_new;
 
     for (int i = 0; i < vowel_frames_new; i++) {
         int dst_idx = consonant_frames_new + i;
         int old_idx = consonant_frames_old +
-                      (int)(i * ((float)vowel_frames_old / vowel_frames_new));
-        if (old_idx >= total_frames) old_idx = total_frames - 1;
-    
-        // take source pointer *before* we touch dst
-        llsm_container* src = chunk->frames[old_idx];
+                      (int)(i *
+                            ((float)vowel_frames_old / vowel_frames_new));
+        if (old_idx >= total_frames)
+            old_idx = total_frames - 1;
+
+        llsm_container* src       = chunk->frames[old_idx];
         llsm_container* new_frame = llsm_copy_container(src);
-    
+
         if (chunk->frames[dst_idx])
             llsm_delete_container(chunk->frames[dst_idx]);
-    
+
         chunk->frames[dst_idx] = new_frame;
     }
 
-    // clean tail frames
-    for (int i = consonant_frames_new + vowel_frames_new; i < total_frames; i++) {
+    // clean tail *within the sample region*
+    for (int i = consonant_frames_new + vowel_frames_new;
+         i < total_frames;
+         i++) {
         if (chunk->frames[i]) {
             llsm_delete_container(chunk->frames[i]);
             chunk->frames[i] = llsm_create_frame(0, 0, 0, 0);
@@ -568,6 +586,8 @@ void apply_tension(llsm_chunk* chunk, FP_TYPE tension) {
         }
     }
 }
+
+
 /*void apply_gender(llsm_chunk* chunk, int gender) {
   int* total_frames = llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
   for (int i = 0; i < *total_frames; ++i) {
@@ -678,7 +698,7 @@ int resample(resampler_data* data) {
   parse_flag_string(data->flags, &flags);
 
   // Build expected .llsm2 path from input WAV path
-  char llsm_path[256];
+  char llsm_path[256]; //TODO: instead of fixed size, dynamically allocate based on length
   snprintf(llsm_path, sizeof(llsm_path), "%s", data->input);
   char* ext = strrchr(llsm_path, '.');
   if (ext) strcpy(ext, ".llsm2");  // Replace extension
@@ -796,8 +816,12 @@ int resample(resampler_data* data) {
   llsm_chunk_tolayer1(chunk_new, 2048);
   llsm_chunk_phasepropagate(chunk_new, -1);
   printf("nfrm: %d\n", total_frames);
-  if (data->velocity != 100.0f){
-    apply_velocity(chunk_new, velocity, &consonant_frames, sample_frames); 
+  int frames_for_velocity = sample_frames;
+  if (frames_for_velocity > total_frames)
+      frames_for_velocity = total_frames;
+
+  if (data->velocity != 100.0f) {
+      apply_velocity(chunk_new, velocity, &consonant_frames, frames_for_velocity);
   }
   // recalculate if we need to stretch the vowel area
   int vowel_sample_frames = sample_frames - consonant_frames;
