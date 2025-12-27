@@ -8,7 +8,7 @@
 #include <libllsm/llsm.h>
 #include <libpyin/pyin.h>
 
-const char* version = "0.2.3";
+const char* version = "0.2.4";
 
 // circular interpolation of two radian values
 static FP_TYPE linterpc(FP_TYPE a, FP_TYPE b, FP_TYPE ratio) {
@@ -417,26 +417,33 @@ float note_to_frequency(const char *note_str) {
     return (float)(440.0 * pow(2.0, (midi - 69) / 12.0));
 }
 
-void convert_cents_to_hz_offset(double* cents, int cents_len,
-                                int nfrm, int nhop, int fs,
-                                float* out_hz) {
-    const float frame_duration_sec = (float)nhop / fs;
-    const float input_interval_sec = 0.005f;  // 5ms per input offset
+void convert_cents_to_hz_offset(const double* cents, int cents_len,
+                                int nfrm, int nhop, int fs, float tempo,
+                                float* out_ratio_offset) {
+
+    const float frame_duration_sec = (float)nhop / (float)fs;
+
+    // PIT grid interval from world4utau: pStep samples per PIT point
+    const float pit_interval_sec = (60.0f / 96.0f) / tempo;  // seconds per PIT element
 
     for (int i = 0; i < nfrm; ++i) {
         float time_sec = i * frame_duration_sec;
-        float idx = time_sec / input_interval_sec;
+
+        float idx = time_sec / pit_interval_sec;
 
         int i0 = (int)idx;
+        if (i0 < 0) i0 = 0;
+        if (i0 >= cents_len) i0 = cents_len - 1;
+
         int i1 = i0 + 1;
         if (i1 >= cents_len) i1 = cents_len - 1;
 
-        float frac = idx - i0;
-        float cents_interp = cents[i0] * (1.0f - frac) + cents[i1] * frac;
+        float frac = idx - (float)i0;
 
-        // Convert cents offset into Hz offset from base (0 cents = 0 Hz offset)
-        float ratio = pow(2.0f, cents_interp / 1200.0f);
-        out_hz[i] = (ratio - 1.0f);  // This is the *offset* in Hz (if applied to a base freq)
+        float cents_interp = (float)(cents[i0] * (1.0f - frac) + cents[i1] * frac);
+
+        float ratio = powf(2.0f, cents_interp / 1200.0f);
+        out_ratio_offset[i] = ratio - 1.0f; // ratio offset, not Hz
     }
 }
 
@@ -791,7 +798,8 @@ int resample(resampler_data* data) {
     return 1;
   }
   
-  convert_cents_to_hz_offset(f0_curve, pit_len, total_frames, nhop, fs, f0_array);
+  convert_cents_to_hz_offset(f0_curve, pit_len, total_frames, nhop, fs, data->tempo, f0_array);
+  printf("pit_len: %d, total_frames: %d\n", pit_len, total_frames);
   for (int i = 0; i < total_frames; ++i) {
     f0_array[i] *= pow(2.0f, (double)flags.t/120);
   }
@@ -854,19 +862,18 @@ int resample(resampler_data* data) {
       }
     }
   }
-  FP_TYPE shift = (FP_TYPE)pow(2.0f, (double)flags.t / 120.0f);
   // Set all f0 to target tone
   for(int i = 0; i < total_frames; i ++) {
     llsm_container_attach(chunk_new->frames[i], LLSM_FRAME_HM, NULL, NULL, NULL);
     FP_TYPE* f0_i = llsm_container_get(chunk_new->frames[i], LLSM_FRAME_F0);
     FP_TYPE old_f0 = f0_i[0];
+
     if (f0_i[0] == 0.00f) {
       continue;
     }
     else {
       f0_i[0] = data->tone * (1.0 + f0_array[i]);
-      f0_i[0] *= shift; // apply pitch shift
-      if (f0_i[0] < 20.0f) f0_i[0] = 20.0f; // minimum F0
+      if (f0_i[0] < 20.0f && f0_i[0] != 0.0f) f0_i[0] = 20.0f; // minimum F0
     }
     // Compensate for the amplitude gain.
     FP_TYPE* vt_magn = llsm_container_get(chunk_new->frames[i],
