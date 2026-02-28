@@ -8,7 +8,7 @@
 #include <libllsm/llsm.h>
 #include <libpyin/pyin.h>
 
-const char* version = "0.2.5";
+const char* version = "0.2.6";
 
 // circular interpolation of two radian values
 static FP_TYPE linterpc(FP_TYPE a, FP_TYPE b, FP_TYPE ratio) {
@@ -639,22 +639,23 @@ FP_TYPE* interp_pitch_to_pitd(FP_TYPE* pitch, int old_nfrm, int new_nfrm) {
     new_pitch[i] = pitch[idx0] * (1.0f - frac) + pitch[idx1] * frac;
   }
   
-  FP_TYPE sum = 0;
-  int count = 0;
+  // Get median ignoring 0 values
+  FP_TYPE* nonzero = malloc(sizeof(FP_TYPE) * new_nfrm);
+  int nz_count = 0;
   for (int i = 0; i < new_nfrm; ++i) {
-    if (new_pitch[i] != 0.0) {
-      sum += new_pitch[i];
-      count++;
+    if (new_pitch[i] > 0.0f) {
+      nonzero[nz_count++] = new_pitch[i];
     }
   }
-  FP_TYPE avg_pitch = (count > 0) ? sum / count : 0;
-  
+
+  FP_TYPE average = (nz_count > 0) ? nonzero[nz_count / 2] : 0.0f;
+
+  free(nonzero);
+
   for (int i = 0; i < new_nfrm; ++i) {
-    if (new_pitch[i] != 0.0) {
-      new_pitch[i] = avg_pitch;
-    }
+    new_pitch[i] = new_pitch[i] - average;
   }
-  
+
   return new_pitch;
 }
 //modulation of original sample's pitch contour
@@ -663,9 +664,7 @@ FP_TYPE* apply_modulation(FP_TYPE* pitch, int mod, int nfrm) {
   if (!modulated_pitch) return NULL;
 
   for (int i = 0; i < nfrm; ++i) {
-    if (pitch[i] > 0.0f) {
-      modulated_pitch[i] = pitch[i] * mod / 100.0f;
-    }
+    modulated_pitch[i] = pitch[i] * (mod / 100.0f);
   }
   return modulated_pitch;
 }
@@ -951,7 +950,8 @@ int resample(resampler_data* data) {
       continue;
     }
     else {
-      f0_i[0] = data->tone * (1.0 + f0_array[i]) + mod_pitch[i];
+      f0_i[0] = data->tone * (1.0 + f0_array[i]);
+      f0_i[0] += mod_pitch[i];
       if (f0_i[0] < 20.0f && f0_i[0] != 0.0f) f0_i[0] = 20.0f; // minimum F0
     }
     // Compensate for the amplitude gain.
