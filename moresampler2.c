@@ -8,7 +8,7 @@
 #include <libllsm/llsm.h>
 #include <libpyin/pyin.h>
 
-const char* version = "0.2.4";
+const char* version = "0.2.5";
 
 // circular interpolation of two radian values
 static FP_TYPE linterpc(FP_TYPE a, FP_TYPE b, FP_TYPE ratio) {
@@ -447,6 +447,10 @@ void convert_cents_to_hz_offset(const double* cents, int cents_len,
     }
 }
 
+FP_TYPE* convert_env_to_vol_arr(int* p, int* v, int nfrm) {
+    return NULL; // TODO
+}
+
 void apply_velocity(llsm_chunk* chunk, float velocity, int* consonant_frames, int total_frames) {
     int consonant_frames_old = *consonant_frames;
 
@@ -478,15 +482,14 @@ void apply_velocity(llsm_chunk* chunk, float velocity, int* consonant_frames, in
         int base = (int)mapped;
         FP_TYPE ratio = mapped - base;
 
-        int residx = base + rand() % 5 - 2;
-        residx = max(0, min(consonant_frames_old - 1, residx));
-        base   = min(base, consonant_frames_old - 2);
+        base = min(base, consonant_frames_old - 2);
+        if (base < 0) base = 0;
 
         tmp->frames[i] = llsm_copy_container(chunk->frames[base]);
         interp_llsm_frame(tmp->frames[i], chunk->frames[base + 1], ratio);
 
         FP_TYPE* resvec =
-            llsm_container_get(chunk->frames[residx], LLSM_FRAME_PSDRES);
+            llsm_container_get(chunk->frames[base], LLSM_FRAME_PSDRES);
         if (resvec != NULL) {
             llsm_container_attach(tmp->frames[i], LLSM_FRAME_PSDRES,
                                   llsm_copy_fparray(resvec),
@@ -609,10 +612,68 @@ void apply_tension(llsm_chunk* chunk, FP_TYPE tension) {
   return;
 }*/
 
+FP_TYPE* get_pitch_from_area(llsm_chunk* chunk, int start, int end) {
+  int* nfrm_p = llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
+  if (!nfrm_p) return NULL;
+
+  FP_TYPE* pitch = malloc(sizeof(FP_TYPE) * (end - start));
+  if (!pitch) return NULL;
+
+  for (int i = start; i < end; ++i) {
+    FP_TYPE f0 = *((FP_TYPE*)llsm_container_get(chunk->frames[i], LLSM_FRAME_F0));
+    pitch[i - start] = f0;
+  }
+
+  return pitch;
+}
+
+FP_TYPE* interp_pitch_to_pitd(FP_TYPE* pitch, int old_nfrm, int new_nfrm) {
+  FP_TYPE* new_pitch = malloc(sizeof(FP_TYPE) * new_nfrm);
+  if (!new_pitch) return NULL;
+
+  for (int i = 0; i < new_nfrm; ++i) {
+    float idx = (float)i * (float)(old_nfrm - 1) / (float)(new_nfrm - 1);
+    int idx0 = (int)idx;
+    int idx1 = min(idx0 + 1, old_nfrm - 1);
+    float frac = idx - (float)idx0;
+    new_pitch[i] = pitch[idx0] * (1.0f - frac) + pitch[idx1] * frac;
+  }
+  
+  FP_TYPE sum = 0;
+  int count = 0;
+  for (int i = 0; i < new_nfrm; ++i) {
+    if (new_pitch[i] != 0.0) {
+      sum += new_pitch[i];
+      count++;
+    }
+  }
+  FP_TYPE avg_pitch = (count > 0) ? sum / count : 0;
+  
+  for (int i = 0; i < new_nfrm; ++i) {
+    if (new_pitch[i] != 0.0) {
+      new_pitch[i] = avg_pitch;
+    }
+  }
+  
+  return new_pitch;
+}
+//modulation of original sample's pitch contour
+FP_TYPE* apply_modulation(FP_TYPE* pitch, int mod, int nfrm) {
+  FP_TYPE* modulated_pitch = malloc(sizeof(FP_TYPE) * nfrm);
+  if (!modulated_pitch) return NULL;
+
+  for (int i = 0; i < nfrm; ++i) {
+    if (pitch[i] > 0.0f) {
+      modulated_pitch[i] = pitch[i] * mod / 100.0f;
+    }
+  }
+  return modulated_pitch;
+}
 
 typedef struct {
     int Mt;
     int t;
+    int P;
     int g;
     int e; // this flag is unused, kept as an example
 } Flags;
@@ -625,6 +686,7 @@ void parse_flag_string(const char* str, Flags* flags_out) {
     int i = 0;
     flags_out->Mt = 0; // default values
     flags_out->t = 0;
+    flags_out->P = 0;
     flags_out->g = 0;
     flags_out->e = 0; // default to false
 
@@ -639,6 +701,11 @@ void parse_flag_string(const char* str, Flags* flags_out) {
             i++;
             flags_out->t = strtol(&str[i], (char**)&str, 10);
             flags_out->t = clamp(flags_out->t, -1200, 1200);
+            continue;
+        } else if (str[i] == 'P') {
+            i++;
+            flags_out->P = strtol(&str[i], (char**)&str, 10);
+            flags_out->P = clamp(flags_out->P, 0, 100);
             continue;
         } else if (str[i] == 'g') {
             i++;
@@ -656,18 +723,27 @@ void parse_flag_string(const char* str, Flags* flags_out) {
     }
 }
 
-void normalize_waveform(FP_TYPE* waveform, int length, FP_TYPE target_peak) {
-    FP_TYPE peak = 0.0f;
-    for (int i = 0; i < length; ++i) {
-        FP_TYPE abs_val = fabsf(waveform[i]);
-        if (abs_val > peak) peak = abs_val;
-    }
+void normalize_waveform(FP_TYPE *waveform, int length, FP_TYPE target_peak,
+                        int P_flag) {
+  if (P_flag <= 0)
+    return;
 
-    if (peak < 1e-9f) return; // avoid divide-by-zero
+  FP_TYPE peak = 0.0f;
+  for (int i = 0; i < length; ++i) {
+    FP_TYPE abs_val = fabsf(waveform[i]);
+    if (abs_val > peak)
+      peak = abs_val;
+  }
 
-    FP_TYPE scale = target_peak / peak;
-    for (int i = 0; i < length; ++i)
-        waveform[i] *= scale;
+  if (peak < 1e-9f)
+    return; // avoid divide-by-zero
+
+  FP_TYPE full_scale = target_peak / peak;
+  FP_TYPE blend = P_flag / 100.0f;
+  FP_TYPE scale = linterp(1.0f, full_scale, blend);
+
+  for (int i = 0; i < length; ++i)
+    waveform[i] *= scale;
 }
 
 int parse_tempo(const char *tempo_str) {
@@ -779,6 +855,7 @@ int resample(resampler_data* data) {
   if (end_frame > nfrm) end_frame = nfrm;
   if (end_frame <= start_frame) end_frame = start_frame + 1;
 
+  
   // Calculate consonant frames (unstretched)
   int consonant_frames = (int)round((data->consonant / 1000.0) * fs / nhop);
   if (consonant_frames > end_frame - start_frame)
@@ -797,6 +874,8 @@ int resample(resampler_data* data) {
     if (opt_s) llsm_delete_soptions(opt_s);
     return 1;
   }
+
+  FP_TYPE* mod_pitch = apply_modulation(interp_pitch_to_pitd(get_pitch_from_area(chunk, start_frame, end_frame), sample_frames, total_frames), data->modulation, total_frames);
   
   convert_cents_to_hz_offset(f0_curve, pit_len, total_frames, nhop, fs, data->tempo, f0_array);
   printf("pit_len: %d, total_frames: %d\n", pit_len, total_frames);
@@ -872,7 +951,7 @@ int resample(resampler_data* data) {
       continue;
     }
     else {
-      f0_i[0] = data->tone * (1.0 + f0_array[i]);
+      f0_i[0] = data->tone * (1.0 + f0_array[i]) + mod_pitch[i];
       if (f0_i[0] < 20.0f && f0_i[0] != 0.0f) f0_i[0] = 20.0f; // minimum F0
     }
     // Compensate for the amplitude gain.
@@ -886,7 +965,6 @@ int resample(resampler_data* data) {
     
   }
 
-  
   llsm_chunk_phasepropagate(chunk_new, 1);
   llsm_chunk_tolayer0(chunk_new);
   apply_tension(chunk_new, flags.Mt); // apply tension based on Mt flag
@@ -899,7 +977,7 @@ int resample(resampler_data* data) {
       return 1;
   }
 
-  normalize_waveform(out->y, out->ny, 0.60f);
+  normalize_waveform(out->y, out->ny, 0.60f, flags.P); // apply P flag normalization
 
   float scale = data->volume / 100.0f;
   for (int i = 0; i < out->ny; ++i)
