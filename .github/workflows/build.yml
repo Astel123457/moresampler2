@@ -1,16 +1,76 @@
-name: PR Build
-
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-
-permissions:
-  contents: write
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - none
+      release_type:
+        description: 'Release'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - beta
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Calculate version
+        id: version
+        shell: bash
+        run: |
+          version=$(cat VERSION)
+          IFS='.' read -r major minor patch <<< "$version"
+
+          case "${{ github.event.inputs.bump }}" in
+            patch) patch=$((patch + 1));;
+            minor) minor=$((minor + 1)); patch=0;;
+            major) major=$((major + 1)); minor=0; patch=0;;
+          esac
+
+          new_version="$major.$minor.$patch"
+
+          if [ "${{ github.event.inputs.release_type }}" = "beta" ]; then
+            tag="v${new_version}-beta.${{ github.run_number }}"
+            prerelease="true"
+          else
+            tag="v${new_version}"
+            prerelease="false"
+          fi
+
+          echo "$new_version" > VERSION
+
+          echo "version=$new_version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+      - name: Commit version bump
+        if: github.event.inputs.bump != 'none'
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add VERSION
+          git commit -m "Bump version to ${{ steps.version.outputs.version }}"
+          git push
+
   build:
+    needs: version
     name: Build on ${{ matrix.os }} (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
 
@@ -37,47 +97,66 @@ jobs:
             runner: macos-latest
 
     steps:
-    - name: Checkout source
-      uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
-    - name: Set up CMake
-      uses: jwlawson/actions-setup-cmake@v1.12
+      - name: Use calculated version
+        run: echo "${{ needs.version.outputs.version }}" > VERSION
 
-    - name: Configure CMake
-      run: >
-        cmake -B build -DCMAKE_BUILD_TYPE=Release
-        ${{ matrix.os == 'windows' && matrix.arch == 'arm64' && '-A ARM64' || '' }}
-        ${{ matrix.os == 'windows' && matrix.arch == 'x64' && '-A x64' || '' }}
-        ${{ matrix.os != 'windows' && matrix.arch == 'arm64' && '-DCMAKE_OSX_ARCHITECTURES=arm64' || '' }}
+      - name: Set up CMake
+        uses: jwlawson/actions-setup-cmake@v1.12
 
-    - name: Build
-      run: cmake --build build --config Release
+      - name: Configure CMake
+        run: >
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          ${{ matrix.os == 'windows' && matrix.arch == 'arm64' && '-A ARM64' || '' }}
+          ${{ matrix.os == 'windows' && matrix.arch == 'x64' && '-A x64' || '' }}
+          ${{ matrix.os != 'windows' && matrix.arch == 'arm64' && '-DCMAKE_OSX_ARCHITECTURES=arm64' || '' }}
 
-    - name: Package binary (Windows)
-      if: matrix.os == 'windows'
-      shell: pwsh
-      run: |
-        mkdir output
-        Copy-Item build\Release\moresampler2.exe output\
-        cd output
-        Compress-Archive -Path moresampler2.exe -DestinationPath moresampler2-${{ matrix.os }}-${{ matrix.arch }}.zip
+      - name: Build
+        run: cmake --build build --config Release
 
-    - name: Package binary (Non-Windows)
-      if: matrix.os != 'windows'
-      shell: bash
-      run: |
-        mkdir output
-        cp build/moresampler2 output/
-        cd output
-        zip moresampler2-${{ matrix.os }}-${{ matrix.arch }}.zip moresampler2
+      - name: Package binary Windows
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          mkdir output
+          Copy-Item build\Release\moresampler2.exe output\
+          cd output
+          Compress-Archive -Path moresampler2.exe -DestinationPath moresampler2-${{ matrix.os }}-${{ matrix.arch }}.zip
 
-    - name: Upload to GitHub Release
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: auto-${{ github.run_id }}  
-        name: Auto Build ${{ github.run_id }}
-        draft: false
-        prerelease: true
-        files: output/moresampler2-${{ matrix.os }}-${{ matrix.arch }}.zip
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Package binary Non-Windows
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          mkdir output
+          cp build/moresampler2 output/
+          cd output
+          zip moresampler2-${{ matrix.os }}-${{ matrix.arch }}.zip moresampler2
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: moresampler2-${{ matrix.os }}-${{ matrix.arch }}
+          path: output/*.zip
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all builds
+        uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: moresampler2 ${{ needs.version.outputs.tag }}
+          draft: false
+          prerelease: ${{ needs.version.outputs.prerelease }}
+          files: release-files/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,44 +1,41 @@
 cmake_minimum_required(VERSION 3.10)
-project(moresampler2 C)
+
+file(READ "${CMAKE_SOURCE_DIR}/VERSION" PROJECT_VERSION_FROM_FILE)
+string(STRIP "${PROJECT_VERSION_FROM_FILE}" PROJECT_VERSION_FROM_FILE)
+
+project(moresampler2 VERSION ${PROJECT_VERSION_FROM_FILE} LANGUAGES C)
+
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 add_definitions(-DFP_TYPE=float)
 
-set(CMAKE_C_STANDARD 99)
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-
-# Add all library subdirectories (in dependency order!)
 add_subdirectory(libs/libgvps)
 add_subdirectory(libs/libpyin)
 add_subdirectory(libs/ciglet)
 add_subdirectory(libs/libllsm)
 
-# Main program
 add_executable(moresampler2 moresampler2.c)
 
-if (WIN32)
-  # Link against all the libraries
+target_compile_definitions(moresampler2 PRIVATE
+    MORESAMPLER2_VERSION="${PROJECT_VERSION_FROM_FILE}"
+)
+
 target_link_libraries(moresampler2 PRIVATE
     llsm
     ciglet
     pyin
     gvps
 )
-endif()
+
 if(NOT WIN32)
-  target_link_libraries(moresampler2 PRIVATE
-    llsm
-    ciglet
-    pyin
-    gvps
-    m  # For math functions on Unix-like systems
-  ) 
+    target_link_libraries(moresampler2 PRIVATE m)
 endif()
 
-# Let main program see all library headers
 target_include_directories(moresampler2 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/libllsm
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/ciglet
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/libpyin
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/libgvps
-    
 )
