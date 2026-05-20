@@ -16,7 +16,7 @@ add_subdirectory(libs/libpyin)
 add_subdirectory(libs/ciglet)
 add_subdirectory(libs/libllsm)
 
-add_executable(moresampler2 moresampler2.c)
+add_executable(moresampler2 moresampler2.c wavtool.c utils.c)
 
 target_compile_definitions(moresampler2 PRIVATE
     MORESAMPLER2_VERSION="${PROJECT_VERSION_FROM_FILE}"
