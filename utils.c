@@ -358,19 +358,28 @@ llsm_chunk* read_llsm(const char* filename, int* nfrm, int* fs, int* nbit) {
   return chunk;
 }
 
-llsm_chunk* get_chunk_from_file(const char* filename, int* nfrm, int* fs, int* nbit, int* nx, int* nhop, llsm_aoptions* opt_a, llsm_soptions* opt_s) {
+char* build_llsm_path(const char* filename) {
+    size_t llsm_path_len = strlen(filename) + 7; // ".llsm2" + null terminator
+    char* llsm_path = malloc(llsm_path_len);
+    if (!llsm_path) return NULL;
+    snprintf(llsm_path, llsm_path_len, "%s", filename);
+    char* ext = strrchr(llsm_path, '.');
+    if (ext) strcpy(ext, ".llsm2"); // Replace extension with .llsm2
+    else strcat(llsm_path, ".llsm2"); // No extension, just append
+    return llsm_path;
+}
+
+llsm_chunk* get_chunk_from_file(const char* filename, int* nfrm, int* fs, int* nbit, int* nx, int* nhop, int nosave, llsm_aoptions* opt_a, llsm_soptions* opt_s) {
 
     llsm_chunk* chunk = NULL;
     FP_TYPE* f0 = NULL;
     FP_TYPE* input = NULL;
 
     // Build expected .llsm2 path from input WAV path
-    size_t llsm_path_len = strlen(filename) + 7; 
-    char* llsm_path = malloc(llsm_path_len);
-    if (!llsm_path) return NULL;
-    snprintf(llsm_path, llsm_path_len, "%s", filename);
-    char* ext = strrchr(llsm_path, '.');
-    if (ext) strcpy(ext, ".llsm2"); 
+    char* llsm_path = build_llsm_path(filename);
+    if (!llsm_path) {
+      printf("WARNING: Failed to build LLSM2 filename path. Analysis will proceed without caching.\n");
+    }
     FILE* llsm_file = fopen(llsm_path, "rb");
 
     if (llsm_file) {
@@ -406,10 +415,13 @@ llsm_chunk* get_chunk_from_file(const char* filename, int* nfrm, int* fs, int* n
       printf("Analysis\n");
       chunk = llsm_analyze(opt_a, input, *nx, *fs, f0, *nfrm, NULL);
       if (!chunk) { free(input); free(f0); free(llsm_path); return NULL; }
-
-      printf("Saving analysis result to cache: %s\n", llsm_path);
-      if (save_llsm(chunk, llsm_path, opt_a, fs, nbit) != 0) {
-        printf("Failed to save .llsm2 file.\n");
+      if(llsm_path != NULL) {
+        printf("Saving analysis result to cache: %s\n", llsm_path);
+          if (!nosave) {
+            if (save_llsm(chunk, llsm_path, opt_a, fs, nbit) != 0) {
+              printf("Failed to save .llsm2 file.\n");
+            }
+          }
       }
       free(llsm_path);
       free(input);

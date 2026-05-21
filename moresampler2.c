@@ -309,57 +309,30 @@ void apply_velocity(llsm_chunk** io_chunk, int* io_nfrm, float velocity,
 // according to my research on the tension parameter in Synthesizer V,
 // as tension increases, the higher harmonics are amplified
 // and as tension decreases, they are attenuated.
+// Apply spectral tilt to the vocal-tract magnitude response (Layer 1 VTMAGN).
+// tension in [-100, 100]: positive = brighter (boost highs), negative = darker.
+// VTMAGN is in dB, so a linear tilt is a simple add.
 void apply_tension(llsm_chunk* chunk, FP_TYPE tension) {
+    if (tension == 0) return;
     int* nfrm_p = llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
     if (!nfrm_p) return;
 
-    // Map [-100,100] -> [-1,1]
+    // Map [-100,100] -> [-1,1], scale to +-24 dB peak tilt
     const FP_TYPE t = tension / (FP_TYPE)100.0;
-
-    // Global strength of spectral tilt in dB (±)
-    const FP_TYPE slope_db = (FP_TYPE)32.0 * t;   // try 14–20 to taste
-
-    // Shape params: pivot ~ where tilt crosses 0; alpha controls knee sharpness
-    const FP_TYPE pivot = (FP_TYPE)0.25;          // 0..1 (slightly below mid so mids participate)
-    const FP_TYPE alpha = (FP_TYPE)2.6;           // 1.6–2.8 soft→hard knee
-    const FP_TYPE eps   = (FP_TYPE)1e-12;
+    const FP_TYPE slope_db = (FP_TYPE)24.0 * t;
 
     for (int i = 0; i < *nfrm_p; ++i) {
-        llsm_hmframe* hm = llsm_container_get(chunk->frames[i], LLSM_FRAME_HM);
-        if (!hm || !hm->ampl || hm->nhar <= 0) continue;
+        FP_TYPE* vt = (FP_TYPE*)llsm_container_get(chunk->frames[i], LLSM_FRAME_VTMAGN);
+        if (!vt) continue;
+        int nspec = llsm_fparray_length(vt);
+        if (nspec < 2) continue;
 
-        // optional: measure pre-tilt energy to normalize later
-        FP_TYPE sum0 = 0;
-        for (int j = 0; j < hm->nhar; ++j) sum0 += hm->ampl[j];
-
-        for (int j = 0; j < hm->nhar; ++j) {
-            // 0..1 index low→high, eased so top doesn’t dominate
-            FP_TYPE w = (hm->nhar > 1) ? (FP_TYPE)j / (FP_TYPE)(hm->nhar - 1) : 0;
-            FP_TYPE w_eased = (FP_TYPE)0.5 - (FP_TYPE)0.5 * (FP_TYPE)cos(M_PI * w); // cosine ease
-
-            // Soft pivoted tilt in dB
-            FP_TYPE h = (FP_TYPE)tanh(alpha * (w_eased - pivot));   // ~[-1,1] with soft knee
-            FP_TYPE g_db = slope_db * h;                             // positive: boost highs, cut lows
-            FP_TYPE a = hm->ampl[j];
-            FP_TYPE adb = (FP_TYPE)20.0 * (FP_TYPE)log10(a + eps);
-            adb += g_db;
-            FP_TYPE anew = (FP_TYPE)pow((FP_TYPE)10.0, adb / (FP_TYPE)20.0);
-
-            if (anew > 1.0) anew = 1.0;
-            if (anew < 0.0) anew = 0.0;
-            hm->ampl[j] = anew;
-        }
-
-        // Optional energy preservation keeps loudness comparable and reveals spectral shape
-        // Comment this block out if you WANT overall loudness to change with tension.
-        FP_TYPE sum1 = 0;
-        for (int j = 0; j < hm->nhar; ++j) sum1 += hm->ampl[j];
-        if (sum0 > 0 && sum1 > 0) {
-            FP_TYPE k = sum0 / sum1;                 // rescale to original total linear amplitude
-            for (int j = 0; j < hm->nhar; ++j) {
-                FP_TYPE v = hm->ampl[j] * k;
-                hm->ampl[j] = v > 1.0 ? 1.0 : v;
-            }
+        // Linear tilt centred at midpoint:
+        //   bin 0 (DC)   gets -slope_db/2
+        //   bin nspec-1  gets +slope_db/2
+        for (int j = 0; j < nspec; ++j) {
+            FP_TYPE w = (FP_TYPE)j / (FP_TYPE)(nspec - 1); // 0..1
+            vt[j] += slope_db * (w - (FP_TYPE)0.5);
         }
     }
 }
@@ -578,7 +551,7 @@ int resample(resampler_data* data) {
   int fs = 0, nbit = 0, nx = 0;
   int nfrm = 0;
 
-  llsm_chunk* chunk = get_chunk_from_file(data->input, &nfrm, &fs, &nbit, &nx, &nhop, opt_a, opt_s);
+  llsm_chunk* chunk = get_chunk_from_file(data->input, &nfrm, &fs, &nbit, &nx, &nhop, 0, opt_a, opt_s);
   if (!chunk) {
     free(f0_curve);
     return 1;
@@ -732,9 +705,15 @@ int resample(resampler_data* data) {
     
   }
   apply_gender(chunk_new, flags.g);
+  apply_tension(chunk_new, flags.Mt); // spectral tilt on VTMAGN while still Layer 1
+  char* output_llsm_path = build_llsm_path(data->output);
+  printf("Saving synthesis result to cache: %s\n", output_llsm_path);
+  if(save_llsm(chunk_new, output_llsm_path, opt_a, &fs, &nbit) != 0) {
+    printf("Failed to save chunk.\n");
+  }
+  free(output_llsm_path);
   llsm_chunk_tolayer0(chunk_new);
   llsm_chunk_phasepropagate(chunk_new, 1);
-  apply_tension(chunk_new, flags.Mt); // apply tension based on Mt flag
   printf("Synthesis\n");
   
   llsm_output* out = llsm_synthesize(opt_s, chunk_new);
