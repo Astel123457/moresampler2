@@ -144,6 +144,8 @@ jobs:
   release:
     needs: [version, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Download all builds
@@ -153,12 +155,11 @@ jobs:
           merge-multiple: true
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           tag_name: ${{ needs.version.outputs.tag }}
           name: moresampler2 ${{ needs.version.outputs.tag }}
           draft: false
           prerelease: ${{ needs.version.outputs.prerelease }}
           files: release-files/*.zip
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
