@@ -9,6 +9,68 @@
 #include <ctype.h>
 #include "utils.h"
 
+#define MS2_CACHE_VERSION_RAW 2
+#define MS2_CACHE_VERSION_L1_HYBRID 3
+#define MS2_VTMAGN_COEFFS 384
+#define MS2_NPSD_COEFFS 96
+
+static void ddct(int n, int isgn, FP_TYPE *a);
+
+static FP_TYPE* ms2_encode_dct(FP_TYPE* values, int n, int order) {
+  int coeff_count = min(order, n);
+  FP_TYPE* dct_full = dct(values, n);
+  FP_TYPE* coeffs = llsm_create_fparray(coeff_count);
+  if (!dct_full || !coeffs) {
+    free(dct_full);
+    llsm_delete_fparray(coeffs);
+    return NULL;
+  }
+  memcpy(coeffs, dct_full, sizeof(FP_TYPE) * (size_t)coeff_count);
+  free(dct_full);
+  return coeffs;
+}
+
+static FP_TYPE* ms2_decode_dct(FP_TYPE* coeffs, int coeff_count, int n) {
+  FP_TYPE* values = llsm_create_fparray(n);
+  if (!values) return NULL;
+
+  FP_TYPE inv_sqrt_n = (FP_TYPE)(1.0 / sqrt((double)n));
+  FP_TYPE inv_sqrt_half_n = (FP_TYPE)sqrt(2.0 / (double)n);
+  for (int i = 0; i < n; ++i) {
+    FP_TYPE value = coeffs[0] * inv_sqrt_n;
+    for (int k = 1; k < coeff_count; ++k) {
+      value += coeffs[k] * inv_sqrt_half_n *
+               (FP_TYPE)cos((double)M_PI / (double)n * (double)(i + 0.5) * (double)k);
+    }
+    values[i] = value;
+  }
+  return values;
+}
+
+float normalize_waveform(FP_TYPE *waveform, int length, FP_TYPE target_peak,
+                        int P_flag) {
+  if (P_flag <= 0)
+    return 0.0f;
+
+  FP_TYPE peak = 0.0f;
+  for (int i = 0; i < length; ++i) {
+    FP_TYPE abs_val = fabsf(waveform[i]);
+    if (abs_val > peak)
+      peak = abs_val;
+  }
+
+  if (peak < 1e-9f)
+    return 0.0f;
+
+  FP_TYPE full_scale = target_peak / peak;
+  FP_TYPE blend = P_flag / 100.0f;
+  FP_TYPE scale = linterp(1.0f, full_scale, blend);
+
+  for (int i = 0; i < length; ++i)
+    waveform[i] *= scale;
+  return 20.0f * log10f(scale);
+}
+
 FP_TYPE ms2_lerp(FP_TYPE a, FP_TYPE b, FP_TYPE t) {
   return a + (b - a) * t;
 }
@@ -177,73 +239,100 @@ int read_conf(FILE* f, llsm_aoptions* opt) {
     return 0;
 }
 
-int save_llsm(llsm_chunk* chunk, const char* filename, llsm_aoptions* conf, int* fs, int* nbit) {
-  // Detect which layer the chunk is in by inspecting the first frame.
+int save_llsm(llsm_chunk* chunk, const char* filename, llsm_aoptions* conf, int* fs, int* nbit, float alias_gain_db) {
   int* nfrm_p = llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
   int nfrm_val = nfrm_p ? *nfrm_p : 0;
   int layer = (nfrm_val > 0 && llsm_frame_checklayer1(chunk->frames[0])) ? 1 : 0;
-
-  // For Layer 1 we need NSPEC from the chunk conf (set by llsm_chunk_tolayer1).
   int nspec = 0;
+  int vtmagn_coeffs = MS2_VTMAGN_COEFFS;
+  int npsd_coeffs = MS2_NPSD_COEFFS;
+
   if (layer == 1) {
     int* nspec_p = llsm_container_get(chunk->conf, LLSM_CONF_NSPEC);
     nspec = nspec_p ? *nspec_p : 0;
+    vtmagn_coeffs = min(vtmagn_coeffs, nspec);
   }
+  npsd_coeffs = min(npsd_coeffs, conf->npsd);
 
   FILE* f = fopen(filename, "wb");
   if (!f) return -1;
 
-  // Version 2 header: adds layer and nspec before nfrm.
+  // Wavtool reloads and resaves layer-1 caches across note concatenation, so
+  // the on-disk cache must stay lossless on the write path.
+  int version = MS2_CACHE_VERSION_RAW;
   fwrite("LLSM2", 1, 5, f);
-  int version = 2;
   fwrite(&version, sizeof(int), 1, f);
-  fwrite(&layer,   sizeof(int), 1, f);
-  fwrite(&nspec,   sizeof(int), 1, f);
+  fwrite(&layer, sizeof(int), 1, f);
+  fwrite(&nspec, sizeof(int), 1, f);
+  fwrite(&alias_gain_db, sizeof(float), 1, f);
   fwrite(&nfrm_val, sizeof(int), 1, f);
-  fwrite(fs,   sizeof(int), 1, f);
+  fwrite(fs, sizeof(int), 1, f);
   fwrite(nbit, sizeof(int), 1, f);
   write_conf(f, conf);
+  if (version == MS2_CACHE_VERSION_L1_HYBRID) {
+    fwrite(&vtmagn_coeffs, sizeof(int), 1, f);
+    fwrite(&npsd_coeffs, sizeof(int), 1, f);
+  }
 
-  // Frame data
   for (int i = 0; i < nfrm_val; ++i) {
     llsm_container* frame = chunk->frames[i];
     FP_TYPE* f0 = llsm_container_get(frame, LLSM_FRAME_F0);
     fwrite(f0, sizeof(FP_TYPE), 1, f);
 
     if (layer == 0) {
-      // Layer 0: harmonic model (nhar, ampl, phse)
       llsm_hmframe* hm = llsm_container_get(frame, LLSM_FRAME_HM);
       fwrite(&hm->nhar, sizeof(int), 1, f);
-      fwrite(hm->ampl,  sizeof(FP_TYPE), hm->nhar, f);
-      fwrite(hm->phse,  sizeof(FP_TYPE), hm->nhar, f);
+      fwrite(hm->ampl, sizeof(FP_TYPE), hm->nhar, f);
+      fwrite(hm->phse, sizeof(FP_TYPE), hm->nhar, f);
     } else {
-      // Layer 1: Rd scalar, VTMAGN fparray, VSPHSE fparray
       FP_TYPE* rd = llsm_container_get(frame, LLSM_FRAME_RD);
       FP_TYPE rd_val = rd ? *rd : (FP_TYPE)1.0;
-      fwrite(&rd_val, sizeof(FP_TYPE), 1, f);
-
       FP_TYPE* vtmagn = llsm_container_get(frame, LLSM_FRAME_VTMAGN);
-      int vtmagn_n = (vtmagn && *f0 > 0) ? llsm_fparray_length(vtmagn) : 0;
-      fwrite(&vtmagn_n, sizeof(int), 1, f);
-      if (vtmagn_n > 0) fwrite(vtmagn, sizeof(FP_TYPE), vtmagn_n, f);
-
       FP_TYPE* vsphse = llsm_container_get(frame, LLSM_FRAME_VSPHSE);
       int vsphse_n = (vsphse && *f0 > 0) ? llsm_fparray_length(vsphse) : 0;
+      fwrite(&rd_val, sizeof(FP_TYPE), 1, f);
+
+      if (version == MS2_CACHE_VERSION_L1_HYBRID) {
+        if (*f0 > 0) {
+          FP_TYPE* vtmagn_coeff = ms2_encode_dct(vtmagn, llsm_fparray_length(vtmagn), vtmagn_coeffs);
+          if (!vtmagn_coeff) {
+            fclose(f);
+            return -1;
+          }
+          fwrite(vtmagn_coeff, sizeof(FP_TYPE), vtmagn_coeffs, f);
+          llsm_delete_fparray(vtmagn_coeff);
+        }
+      } else {
+        int vtmagn_n = (vtmagn && *f0 > 0) ? llsm_fparray_length(vtmagn) : 0;
+        fwrite(&vtmagn_n, sizeof(int), 1, f);
+        if (vtmagn_n > 0) fwrite(vtmagn, sizeof(FP_TYPE), vtmagn_n, f);
+      }
+
       fwrite(&vsphse_n, sizeof(int), 1, f);
       if (vsphse_n > 0) fwrite(vsphse, sizeof(FP_TYPE), vsphse_n, f);
     }
 
-    // NM is identical in both layers
     llsm_nmframe* nm = llsm_container_get(frame, LLSM_FRAME_NM);
-    fwrite(&nm->npsd, sizeof(int), 1, f);
-    fwrite(nm->psd,   sizeof(FP_TYPE), nm->npsd, f);
-    fwrite(&nm->nchannel, sizeof(int), 1, f);
+    if (version == MS2_CACHE_VERSION_L1_HYBRID && layer == 1) {
+      FP_TYPE* psd_coeff = ms2_encode_dct(nm->psd, nm->npsd, npsd_coeffs);
+      if (!psd_coeff) {
+        fclose(f);
+        return -1;
+      }
+      fwrite(psd_coeff, sizeof(FP_TYPE), npsd_coeffs, f);
+      llsm_delete_fparray(psd_coeff);
+    } else {
+      fwrite(&nm->npsd, sizeof(int), 1, f);
+      fwrite(nm->psd, sizeof(FP_TYPE), nm->npsd, f);
+      fwrite(&nm->nchannel, sizeof(int), 1, f);
+    }
+
     for (int j = 0; j < nm->nchannel; ++j) {
-      fwrite(&nm->edc[j], sizeof(FP_TYPE), 1, f);
       llsm_hmframe* eenv = nm->eenv[j];
+      fwrite(&nm->edc[j], sizeof(FP_TYPE), 1, f);
       fwrite(&eenv->nhar, sizeof(int), 1, f);
-      fwrite(eenv->ampl,  sizeof(FP_TYPE), eenv->nhar, f);
-      fwrite(eenv->phse,  sizeof(FP_TYPE), eenv->nhar, f);
+      fwrite(eenv->ampl, sizeof(FP_TYPE), eenv->nhar, f);
+      fwrite(eenv->phse, sizeof(FP_TYPE), eenv->nhar, f);
     }
   }
 
@@ -251,7 +340,7 @@ int save_llsm(llsm_chunk* chunk, const char* filename, llsm_aoptions* conf, int*
   return 0;
 }
 
-llsm_chunk* read_llsm(const char* filename, int* nfrm, int* fs, int* nbit) {
+llsm_chunk* read_llsm(const char* filename, int* nfrm, int* fs, int* nbit, float* alias_gain_db) {
   FILE* f = fopen(filename, "rb");
   if (!f) return NULL;
 
@@ -261,17 +350,27 @@ llsm_chunk* read_llsm(const char* filename, int* nfrm, int* fs, int* nbit) {
 
   int version;
   fread(&version, sizeof(int), 1, f);
-  if (version != 1 && version != 2) { fclose(f); return NULL; }
+  if (version != 1 && version != MS2_CACHE_VERSION_RAW && version != MS2_CACHE_VERSION_L1_HYBRID) {
+    fclose(f);
+    return NULL;
+  }
 
-  // Version 2 adds layer and nspec before nfrm.
-  int layer = 0, nspec = 0;
-  if (version == 2) {
-    fread(&layer, sizeof(int), 1, f);
-    fread(&nspec, sizeof(int), 1, f);
+  int layer = 0;
+  int nspec = 0;
+  float tmp_alias_gain_db = 0.0f;
+
+  if (version >= 2) {
+      fread(&layer, sizeof(int), 1, f);
+      fread(&nspec, sizeof(int), 1, f);
+
+      if (alias_gain_db)
+          fread(alias_gain_db, sizeof(float), 1, f);
+      else
+          fread(&tmp_alias_gain_db, sizeof(float), 1, f);
   }
 
   fread(nfrm, sizeof(int), 1, f);
-  fread(fs,   sizeof(int), 1, f);
+  fread(fs, sizeof(int), 1, f);
   fread(nbit, sizeof(int), 1, f);
 
   llsm_aoptions* aopt = llsm_create_aoptions();
@@ -280,7 +379,10 @@ llsm_chunk* read_llsm(const char* filename, int* nfrm, int* fs, int* nbit) {
     fclose(f);
     return NULL;
   }
+
   llsm_container* conf = llsm_aoptions_toconf(aopt, 44100.0 / 2);
+  int conf_npsd = aopt->npsd;
+  int conf_nchannel = aopt->nchannel;
   llsm_delete_aoptions(aopt);
   llsm_container_attach(conf, LLSM_CONF_NFRM,
     llsm_create_int(*nfrm), llsm_delete_int, llsm_copy_int);
@@ -288,19 +390,24 @@ llsm_chunk* read_llsm(const char* filename, int* nfrm, int* fs, int* nbit) {
     llsm_container_attach(conf, LLSM_CONF_NSPEC,
       llsm_create_int(nspec), llsm_delete_int, llsm_copy_int);
   }
+
+  int vtmagn_coeffs = 0;
+  int npsd_coeffs = 0;
+  if (version == MS2_CACHE_VERSION_L1_HYBRID) {
+    fread(&vtmagn_coeffs, sizeof(int), 1, f);
+    fread(&npsd_coeffs, sizeof(int), 1, f);
+  }
+
   llsm_chunk* chunk = llsm_create_chunk(conf, *nfrm);
   llsm_delete_container(conf);
 
   for (int i = 0; i < *nfrm; ++i) {
     llsm_container* frame = llsm_create_frame(0, 0, 0, 0);
-
-    // F0 (same for both layers)
     FP_TYPE* f0 = malloc(sizeof(FP_TYPE));
     fread(f0, sizeof(FP_TYPE), 1, f);
     llsm_container_attach(frame, LLSM_FRAME_F0, f0, free, llsm_copy_fp);
 
     if (layer == 0) {
-      // Layer 0: harmonic model
       int nhar;
       fread(&nhar, sizeof(int), 1, f);
       llsm_hmframe* hm = llsm_create_hmframe(nhar);
@@ -308,20 +415,31 @@ llsm_chunk* read_llsm(const char* filename, int* nfrm, int* fs, int* nbit) {
       fread(hm->phse, sizeof(FP_TYPE), nhar, f);
       llsm_container_attach(frame, LLSM_FRAME_HM, hm, llsm_delete_hmframe, llsm_copy_hmframe);
     } else {
-      // Layer 1: Rd, VTMAGN, VSPHSE
-      // llsm_create_frame pre-attaches HM(nhar=0); remove it so
-      // llsm_frame_checklayer0 won't mistake this for a Layer 0 frame.
       llsm_container_remove(frame, LLSM_FRAME_HM);
       FP_TYPE* rd = malloc(sizeof(FP_TYPE));
       fread(rd, sizeof(FP_TYPE), 1, f);
       llsm_container_attach(frame, LLSM_FRAME_RD, rd, llsm_delete_fp, llsm_copy_fp);
 
-      int vtmagn_n;
-      fread(&vtmagn_n, sizeof(int), 1, f);
-      if (vtmagn_n > 0) {
-        FP_TYPE* vtmagn = llsm_create_fparray(vtmagn_n);
-        fread(vtmagn, sizeof(FP_TYPE), vtmagn_n, f);
+      if (version == MS2_CACHE_VERSION_L1_HYBRID && *f0 > 0) {
+        FP_TYPE* coeff = llsm_create_fparray(vtmagn_coeffs);
+        FP_TYPE* vtmagn = NULL;
+        fread(coeff, sizeof(FP_TYPE), vtmagn_coeffs, f);
+        vtmagn = ms2_decode_dct(coeff, vtmagn_coeffs, nspec);
+        llsm_delete_fparray(coeff);
+        if (!vtmagn) {
+          llsm_delete_chunk(chunk);
+          fclose(f);
+          return NULL;
+        }
         llsm_container_attach(frame, LLSM_FRAME_VTMAGN, vtmagn, llsm_delete_fparray, llsm_copy_fparray);
+      } else {
+        int vtmagn_n;
+        fread(&vtmagn_n, sizeof(int), 1, f);
+        if (vtmagn_n > 0) {
+          FP_TYPE* vtmagn = llsm_create_fparray(vtmagn_n);
+          fread(vtmagn, sizeof(FP_TYPE), vtmagn_n, f);
+          llsm_container_attach(frame, LLSM_FRAME_VTMAGN, vtmagn, llsm_delete_fparray, llsm_copy_fparray);
+        }
       }
 
       int vsphse_n;
@@ -333,14 +451,29 @@ llsm_chunk* read_llsm(const char* filename, int* nfrm, int* fs, int* nbit) {
       }
     }
 
-    // NM (same for both layers)
     llsm_nmframe* nm = malloc(sizeof(llsm_nmframe));
-    fread(&nm->npsd, sizeof(int), 1, f);
-    nm->psd = malloc(sizeof(FP_TYPE) * nm->npsd);
-    fread(nm->psd, sizeof(FP_TYPE), nm->npsd, f);
-    fread(&nm->nchannel, sizeof(int), 1, f);
-    nm->edc  = malloc(sizeof(FP_TYPE)      * nm->nchannel);
-    nm->eenv = malloc(sizeof(llsm_hmframe*) * nm->nchannel);
+    if (version == MS2_CACHE_VERSION_L1_HYBRID && layer == 1) {
+      FP_TYPE* coeff = llsm_create_fparray(npsd_coeffs);
+      nm->npsd = conf_npsd;
+      nm->nchannel = conf_nchannel;
+      fread(coeff, sizeof(FP_TYPE), npsd_coeffs, f);
+      nm->psd = ms2_decode_dct(coeff, npsd_coeffs, nm->npsd);
+      llsm_delete_fparray(coeff);
+      if (!nm->psd) {
+        free(nm);
+        llsm_delete_chunk(chunk);
+        fclose(f);
+        return NULL;
+      }
+    } else {
+      fread(&nm->npsd, sizeof(int), 1, f);
+      nm->psd = malloc(sizeof(FP_TYPE) * (size_t)nm->npsd);
+      fread(nm->psd, sizeof(FP_TYPE), nm->npsd, f);
+      fread(&nm->nchannel, sizeof(int), 1, f);
+    }
+
+    nm->edc = malloc(sizeof(FP_TYPE) * (size_t)nm->nchannel);
+    nm->eenv = malloc(sizeof(llsm_hmframe*) * (size_t)nm->nchannel);
     for (int j = 0; j < nm->nchannel; ++j) {
       fread(&nm->edc[j], sizeof(FP_TYPE), 1, f);
       int nhar_e;
@@ -369,7 +502,8 @@ char* build_llsm_path(const char* filename) {
     return llsm_path;
 }
 
-llsm_chunk* get_chunk_from_file(const char* filename, int* nfrm, int* fs, int* nbit, int* nx, int* nhop, int nosave, llsm_aoptions* opt_a, llsm_soptions* opt_s) {
+llsm_chunk* get_chunk_from_file(const char* filename, int* nfrm, int* fs, int* nbit,
+    int* nx, int* nhop, int nosave, int force_analysis, llsm_aoptions* opt_a) {
 
     llsm_chunk* chunk = NULL;
     FP_TYPE* f0 = NULL;
@@ -382,31 +516,41 @@ llsm_chunk* get_chunk_from_file(const char* filename, int* nfrm, int* fs, int* n
     }
     FILE* llsm_file = fopen(llsm_path, "rb");
 
-    if (llsm_file) {
+    if (llsm_file && !force_analysis) {
       // File exists — use cached analysis
       fclose(llsm_file);
       printf("Loading cached LLSM analysis: %s\n", llsm_path);
-      chunk = read_llsm(llsm_path, nfrm, fs, nbit);
+      chunk = read_llsm(llsm_path, nfrm, fs, nbit, NULL);
       free(llsm_path);
       if (!chunk) {
         printf("Failed to read .llsm2 file\n");
         return NULL;
       }
     } else {
+      if (llsm_file) fclose(llsm_file);
       // No cache — analyze audio
       printf("Reading input WAV: %s\n", filename);
-      input = wavread(filename, fs, nbit, nx);
+      input = wavread((char*)filename, fs, nbit, nx);
       if (!input) { free(llsm_path); return NULL; }
     
       printf("Estimating F0\n");
+
+      float* input_temp;
+      //copy input to input_temp
+      input_temp = malloc(sizeof(float) * (size_t)(*nx));
+      if (!input_temp) { free(input); free(llsm_path); return NULL; }
+      for (int i = 0; i < *nx; ++i) {
+        input_temp[i] = input[i];
+      }
+      normalize_waveform(input_temp, *nx, 0.99f, 100);
       pyin_config param = pyin_init(*nhop);
       param.fmin = 50.0f;
       param.fmax = 800.0f;
       param.trange = 24;
       param.bias = 2;
       param.nf = ceil(*fs * 0.025);
-      f0 = pyin_analyze(param, input, *nx, *fs, nfrm);
-      if (!f0) { free(input); free(llsm_path); return NULL; }
+      f0 = pyin_analyze(param, input_temp, *nx, *fs, nfrm);
+      if (!f0) { free(input); free(input_temp); free(llsm_path); return NULL; }
     
       opt_a->thop = (FP_TYPE)(*nhop) / (*fs);
       opt_a->f0_refine = 1;
@@ -414,16 +558,17 @@ llsm_chunk* get_chunk_from_file(const char* filename, int* nfrm, int* fs, int* n
     
       printf("Analysis\n");
       chunk = llsm_analyze(opt_a, input, *nx, *fs, f0, *nfrm, NULL);
-      if (!chunk) { free(input); free(f0); free(llsm_path); return NULL; }
+      if (!chunk) { free(input); free(f0); free(input_temp); free(llsm_path); return NULL; }
       if(llsm_path != NULL) {
         printf("Saving analysis result to cache: %s\n", llsm_path);
           if (!nosave) {
-            if (save_llsm(chunk, llsm_path, opt_a, fs, nbit) != 0) {
+            if (save_llsm(chunk, llsm_path, opt_a, fs, nbit, 0.0f) != 0) {
               printf("Failed to save .llsm2 file.\n");
             }
           }
       }
       free(llsm_path);
+      free(input_temp);
       free(input);
       free(f0);
     }

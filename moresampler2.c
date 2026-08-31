@@ -6,6 +6,7 @@
 #include <ctype.h>
 #include "utils.h"
 #include "wavtool.h"
+#include "moresampler2.h"
 #include <ciglet/ciglet.h>
 #include <libllsm/llsm.h>
 
@@ -36,7 +37,7 @@ int base64decoderForUtau(char x, char y)
 	return ans;
 }
 
-int getF0Contour(char *input, double *output)
+int getF0Contour(const char *input, double *output)
 {
 	int i, j, count, length;
 	i = 0;
@@ -312,20 +313,16 @@ void apply_velocity(llsm_chunk** io_chunk, int* io_nfrm, float velocity,
 // Apply spectral tilt to the vocal-tract magnitude response (Layer 1 VTMAGN).
 // tension in [-100, 100]: positive = brighter (boost highs), negative = darker.
 // VTMAGN is in dB, so a linear tilt is a simple add.
-void apply_tension(llsm_chunk* chunk, FP_TYPE tension) {
-    if (tension == 0) return;
-    int* nfrm_p = llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
-    if (!nfrm_p) return;
-
+static void apply_tension_frame(llsm_container* frame, FP_TYPE tension) {
+    if (!frame || tension == 0) return;
     // Map [-100,100] -> [-1,1], scale to +-24 dB peak tilt
     const FP_TYPE t = tension / (FP_TYPE)100.0;
     const FP_TYPE slope_db = (FP_TYPE)24.0 * t;
 
-    for (int i = 0; i < *nfrm_p; ++i) {
-        FP_TYPE* vt = (FP_TYPE*)llsm_container_get(chunk->frames[i], LLSM_FRAME_VTMAGN);
-        if (!vt) continue;
+        FP_TYPE* vt = (FP_TYPE*)llsm_container_get(frame, LLSM_FRAME_VTMAGN);
+        if (!vt) return;
         int nspec = llsm_fparray_length(vt);
-        if (nspec < 2) continue;
+        if (nspec < 2) return;
 
         // Linear tilt centred at midpoint:
         //   bin 0 (DC)   gets -slope_db/2
@@ -334,28 +331,48 @@ void apply_tension(llsm_chunk* chunk, FP_TYPE tension) {
             FP_TYPE w = (FP_TYPE)j / (FP_TYPE)(nspec - 1); // 0..1
             vt[j] += slope_db * (w - (FP_TYPE)0.5);
         }
-    }
+}
+
+static FP_TYPE curve_value(const float* curve, int length, int index, int count) {
+    if (!curve || length <= 0 || count <= 1) return 0;
+    FP_TYPE position = (FP_TYPE)index * (length - 1) / (count - 1);
+    int left = (int)floor(position);
+    int right = min(length - 1, left + 1);
+    FP_TYPE alpha = position - left;
+    return curve[left] * (1 - alpha) + curve[right] * alpha;
+}
+
+void apply_tension(llsm_chunk* chunk, FP_TYPE tension) {
+    if (!chunk) return;
+    int* nfrm_p = llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
+    if (!nfrm_p) return;
+    for (int i = 0; i < *nfrm_p; ++i)
+        apply_tension_frame(chunk->frames[i], tension);
+}
+
+void apply_tension_curve(llsm_chunk* chunk, const float* curve, int length) {
+    if (!chunk || !curve || length <= 0) return;
+    int* nfrm_p = llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
+    if (!nfrm_p) return;
+    for (int i = 0; i < *nfrm_p; ++i)
+        apply_tension_frame(chunk->frames[i], curve_value(curve, length, i, *nfrm_p));
 }
 
 
-void apply_gender(llsm_chunk* chunk, FP_TYPE gender) {
-  if (!chunk) return;
-
-  int* nfrm_p = llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
-
+static void apply_gender_frame(llsm_container* frame, FP_TYPE gender) {
+  if (!frame) return;
   if (gender > (FP_TYPE)100.0) gender = (FP_TYPE)100.0;
   if (gender < (FP_TYPE)-100.0) gender = (FP_TYPE)-100.0;
   FP_TYPE ratio = (FP_TYPE)pow(2.0, (double)(gender / (FP_TYPE)100.0));
 
 
-  for (int i = 0; i < *nfrm_p; ++i) {
-    FP_TYPE* vt = (FP_TYPE*)llsm_container_get(chunk->frames[i], LLSM_FRAME_VTMAGN);
-    if (!vt) continue;
+    FP_TYPE* vt = (FP_TYPE*)llsm_container_get(frame, LLSM_FRAME_VTMAGN);
+    if (!vt) return;
     int nspec = llsm_fparray_length(vt);
-    if (nspec <= 1) continue;
+    if (nspec <= 1) return;
 
     FP_TYPE* src = (FP_TYPE*)malloc(sizeof(FP_TYPE) * (size_t)nspec);
-    if (!src) continue;
+    if (!src) return;
     memcpy(src, vt, sizeof(FP_TYPE) * (size_t)nspec);
 
     for (int j = 0; j < nspec; ++j) {
@@ -372,8 +389,23 @@ void apply_gender(llsm_chunk* chunk, FP_TYPE gender) {
 
     free(src);
 
-    llsm_container_remove(chunk->frames[i], LLSM_FRAME_HM);
-  }
+    llsm_container_remove(frame, LLSM_FRAME_HM);
+}
+
+void apply_gender(llsm_chunk* chunk, FP_TYPE gender) {
+  if (!chunk) return;
+  int* nfrm_p = llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
+  if (!nfrm_p) return;
+  for (int i = 0; i < *nfrm_p; ++i)
+    apply_gender_frame(chunk->frames[i], gender);
+}
+
+void apply_gender_curve(llsm_chunk* chunk, const float* curve, int length) {
+  if (!chunk || !curve || length <= 0) return;
+  int* nfrm_p = llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
+  if (!nfrm_p) return;
+  for (int i = 0; i < *nfrm_p; ++i)
+    apply_gender_frame(chunk->frames[i], curve_value(curve, length, i, *nfrm_p));
 }
 
 FP_TYPE* get_pitch_from_area(llsm_chunk* chunk, int start, int end) {
@@ -484,29 +516,6 @@ void parse_flag_string(const char* str, Flags* flags_out) {
     }
 }
 
-void normalize_waveform(FP_TYPE *waveform, int length, FP_TYPE target_peak,
-                        int P_flag) {
-  if (P_flag <= 0)
-    return;
-
-  FP_TYPE peak = 0.0f;
-  for (int i = 0; i < length; ++i) {
-    FP_TYPE abs_val = fabsf(waveform[i]);
-    if (abs_val > peak)
-      peak = abs_val;
-  }
-
-  if (peak < 1e-9f)
-    return; // avoid divide-by-zero
-
-  FP_TYPE full_scale = target_peak / peak;
-  FP_TYPE blend = P_flag / 100.0f;
-  FP_TYPE scale = linterp(1.0f, full_scale, blend);
-
-  for (int i = 0; i < length; ++i)
-    waveform[i] *= scale;
-}
-
 int parse_tempo(const char *tempo_str) {
     if (tempo_str[0] == '!') {
         tempo_str++;  // skip the '!'
@@ -514,30 +523,24 @@ int parse_tempo(const char *tempo_str) {
     return atoi(tempo_str);
 }
 
-typedef struct {
-    char* input;  // Path to the input audio file
-    char* output; // Path to the output audio file
-    float tone; // Musical pitch of the note to be resampled, in hertz
-    float velocity; // velocity of the consontant area
-    char* flags; // raw string of resampler flags
-    float offset; // offset in milliseconds
-    float length; // length of the note in milliseconds
-    float consonant; // length of the consonant area in milliseconds
-    float cutoff; // cutoff frequency in hertz
-    int volume; // volume of the note, 0-100
-    int modulation; // modulation value, 0-100
-    int tempo; // tempo in beats per minute
-    char* pitch_curve; // pitch curve data
-} resampler_data;
-
-
-
-int resample(resampler_data* data) {
+static int ms2_process(const ms2_resampler_request* data,
+    llsm_chunk** phrase_chunk, float* phrase_gain_db,
+    int* phrase_fs, int* phrase_nbit) {
   // Allocate and load pitch curve
-  // TODO: instead of fixed size, dynamically allocate based on length of input curve
-  double* f0_curve = malloc(sizeof(double) * 3000);
+  int direct_pitch_count = data->pitch_values && data->pitch_value_count > 0
+    ? data->pitch_value_count : 0;
+  int f0_capacity = direct_pitch_count > 0 ? direct_pitch_count : 3000;
+  double* f0_curve = malloc(sizeof(double) * (size_t)f0_capacity);
   if (!f0_curve) return 1;
-  int pit_len = getF0Contour(data->pitch_curve, f0_curve);
+  int pit_len = direct_pitch_count;
+  if (direct_pitch_count > 0) {
+    for (int i = 0; i < direct_pitch_count; ++i) f0_curve[i] = data->pitch_values[i];
+  } else if (data->pitch_curve && data->pitch_curve[0]) {
+    pit_len = getF0Contour(data->pitch_curve, f0_curve);
+  } else {
+    f0_curve[0] = 0;
+    pit_len = 1;
+  }
   if (!pit_len) { free(f0_curve); return 1; }
 
   float velocity = (float)exp2(1 - data->velocity / 100.0f);
@@ -551,7 +554,8 @@ int resample(resampler_data* data) {
   int fs = 0, nbit = 0, nx = 0;
   int nfrm = 0;
 
-  llsm_chunk* chunk = get_chunk_from_file(data->input, &nfrm, &fs, &nbit, &nx, &nhop, 0, opt_a, opt_s);
+  llsm_chunk* chunk = get_chunk_from_file(data->input, &nfrm, &fs, &nbit,
+    &nx, &nhop, 0, 0, opt_a);
   if (!chunk) {
     free(f0_curve);
     return 1;
@@ -619,7 +623,6 @@ int resample(resampler_data* data) {
   }
   llsm_chunk_tolayer1(chunk_new, 2048);
   llsm_chunk_phasepropagate(chunk_new, -1);
-  printf("nfrm: %d\n", total_frames);
 
   // chunk_nfrm tracks the actual number of filled frames in chunk_new;
   // total_frames is the desired output length and must not change.
@@ -704,14 +707,15 @@ int resample(resampler_data* data) {
     }
     
   }
-  apply_gender(chunk_new, flags.g);
-  apply_tension(chunk_new, flags.Mt); // spectral tilt on VTMAGN while still Layer 1
-  char* output_llsm_path = build_llsm_path(data->output);
-  printf("Saving synthesis result to cache: %s\n", output_llsm_path);
-  if(save_llsm(chunk_new, output_llsm_path, opt_a, &fs, &nbit) != 0) {
-    printf("Failed to save chunk.\n");
-  }
-  free(output_llsm_path);
+  if (data->gender_curve && data->expression_count > 0)
+    apply_gender_curve(chunk_new, data->gender_curve, data->expression_count);
+  else
+    apply_gender(chunk_new, flags.g);
+  if (data->tension_curve && data->expression_count > 0)
+    apply_tension_curve(chunk_new, data->tension_curve, data->expression_count);
+  else
+    apply_tension(chunk_new, flags.Mt); // spectral tilt on VTMAGN while still Layer 1
+  llsm_chunk* cache_chunk = llsm_copy_chunk(chunk_new);
   llsm_chunk_tolayer0(chunk_new);
   llsm_chunk_phasepropagate(chunk_new, 1);
   printf("Synthesis\n");
@@ -720,16 +724,41 @@ int resample(resampler_data* data) {
 
   if (!out || !out->y) {
       printf("Failed to synthesize output: %d\n", out);
+      if (cache_chunk) llsm_delete_chunk(cache_chunk);
       return 1;
   }
 
-  normalize_waveform(out->y, out->ny, 0.50f, flags.P); // apply P flag normalization
+  float alias_gain_db = normalize_waveform(out->y, out->ny, 0.50f, flags.P);
+
+  if (phrase_chunk) {
+    float volume = data->volume > 0 ? data->volume / 100.0f : 0.0001f;
+    *phrase_chunk = cache_chunk;
+    if (phrase_gain_db) *phrase_gain_db = alias_gain_db + 20.0f * log10f(volume);
+    if (phrase_fs) *phrase_fs = fs;
+    if (phrase_nbit) *phrase_nbit = nbit;
+    llsm_delete_output(out);
+    llsm_delete_chunk(chunk);
+    llsm_delete_chunk(chunk_new);
+    llsm_delete_aoptions(opt_a);
+    llsm_delete_soptions(opt_s);
+    free(f0_curve);
+    return 0;
+  }
+
+  char* output_llsm_path = build_llsm_path(data->output);
+  printf("Saving synthesis result to cache: %s\n", output_llsm_path);
+  if (!cache_chunk || save_llsm(cache_chunk, output_llsm_path, opt_a,
+      &fs, &nbit, alias_gain_db) != 0) {
+    printf("Failed to save chunk.\n");
+  }
+  free(output_llsm_path);
+  if (cache_chunk) llsm_delete_chunk(cache_chunk);
 
   float scale = data->volume / 100.0f;
   for (int i = 0; i < out->ny; ++i)
     out->y[i] *= scale;
   
-  wavwrite(out->y, out->ny, fs, nbit, data->output);
+  wavwrite(out->y, out->ny, fs, nbit, (char*)data->output);
   
 
   llsm_delete_output(out);
@@ -741,6 +770,114 @@ int resample(resampler_data* data) {
   return 0;
 }
 
+int ms2_resample(const ms2_resampler_request* data) {
+  return ms2_process(data, NULL, NULL, NULL, NULL);
+}
+
+int ms2_analyze_v1(const char* input, const char* output) {
+  if (!input || !input[0] || !output || !output[0]) return 1;
+  llsm_aoptions* options = llsm_create_aoptions();
+  int frames = 0, fs = 0, bits = 0, samples = 0, hop = 128;
+  llsm_chunk* chunk = get_chunk_from_file(input, &frames, &fs, &bits,
+    &samples, &hop, 1, 1, options);
+  if (!chunk) {
+    llsm_delete_aoptions(options);
+    return 2;
+  }
+  int code = save_llsm(chunk, output, options, &fs, &bits, 0.0f) == 0 ? 0 : 3;
+  llsm_delete_chunk(chunk);
+  llsm_delete_aoptions(options);
+  return code;
+}
+
+int ms2_validate_analysis_v1(const char* analysis) {
+  if (!analysis || !analysis[0]) return 1;
+  int frames = 0, fs = 0, bits = 0;
+  llsm_chunk* chunk = read_llsm(analysis, &frames, &fs, &bits, NULL);
+  if (!chunk) return 2;
+  llsm_delete_chunk(chunk);
+  return frames > 0 && fs > 0 ? 0 : 3;
+}
+
+int ms2_render_phrase_v1(const ms2_phrase_request* request, ms2_render_result* result) {
+  if (!request || !result || !request->phones || request->phone_count <= 0 ||
+      !request->output || !request->output[0]) return 1;
+  result->samples = NULL;
+  result->sample_count = 0;
+  result->sample_rate = 0;
+  wavtool_phrase* phrase = wavtool_phrase_create();
+  if (!phrase) return 1;
+
+  for (int p = 0; p < request->phone_count; ++p) {
+    const ms2_phrase_phone* phone = &request->phones[p];
+    llsm_chunk* phone_chunk = NULL;
+    float gain_db = 0;
+    int fs = 0, nbit = 0;
+    if (ms2_process(&phone->synthesis, &phone_chunk, &gain_db, &fs, &nbit) != 0) {
+      wavtool_phrase_delete(phrase);
+      return 2;
+    }
+    if (!phone->envelope_x_ms || !phone->envelope_y || phone->envelope_count < 5) {
+      llsm_delete_chunk(phone_chunk);
+      wavtool_phrase_delete(phrase);
+      return 3;
+    }
+    wavtool_data data = {0};
+    data.offset = phone->skip_ms;
+    data.length = phone->length_ms;
+    data.p1 = 0;
+    data.p2 = phone->envelope_x_ms[1] - phone->envelope_x_ms[0];
+    data.p3 = phone->envelope_x_ms[4] - phone->envelope_x_ms[3];
+    data.p4 = 0;
+    data.p5 = phone->envelope_x_ms[2] - phone->envelope_x_ms[0];
+    data.v1 = phone->envelope_y[0] * 100;
+    data.v2 = phone->envelope_y[1] * 100;
+    data.v3 = phone->envelope_y[3] * 100;
+    data.v4 = phone->envelope_y[4] * 100;
+    data.v5 = phone->envelope_y[2] * 100;
+    data.ovr = phone->overlap_ms;
+    data.position = phone->position_ms;
+    data.use_position = 1;
+    if (wavtool_phrase_add(phrase, phone_chunk, fs, nbit, gain_db, &data) != 0) {
+      llsm_delete_chunk(phone_chunk);
+      wavtool_phrase_delete(phrase);
+      return 4;
+    }
+    llsm_delete_chunk(phone_chunk);
+  }
+
+  int rendered_count = 0;
+  float* rendered = NULL;
+  if (wavtool_phrase_synthesize(phrase, &rendered, &rendered_count,
+      &result->sample_rate) != 0) {
+    wavtool_phrase_delete(phrase);
+    return 5;
+  }
+  wavtool_phrase_delete(phrase);
+  int target_count = (int)ceil(request->duration_ms * result->sample_rate / 1000.0f);
+  if (target_count <= 0) {
+    free(rendered);
+    return 5;
+  }
+  result->samples = (float*)calloc((size_t)target_count, sizeof(float));
+  if (!result->samples) {
+    free(rendered);
+    return 5;
+  }
+  memcpy(result->samples, rendered,
+    sizeof(float) * (size_t)min(rendered_count, target_count));
+  free(rendered);
+  result->sample_count = target_count;
+  wavwrite(result->samples, result->sample_count, result->sample_rate, 16,
+    (char*)request->output);
+  return 0;
+}
+
+void ms2_free(void* pointer) {
+  free(pointer);
+}
+
+#ifndef MORESAMPLER2_NO_MAIN
 int main(int argc, char* argv[]) {
     printf("moresampler2 version %s\n", version);
     if (argc == 2) { // user dragged and dropped a folder into the executable
@@ -756,7 +893,7 @@ int main(int argc, char* argv[]) {
     // When argc == 14, disambiguate by checking if argv[3] starts with a digit.
     if (argc >= 14 && argc <= 16 &&
         (isdigit((unsigned char)argv[3][0]) || argv[3][0] == '-')) {
-        wavtool_data data;
+        wavtool_data data = {0};
         data.output = argv[1];
         data.input  = argv[2];
         data.offset = atof(argv[3]);
@@ -775,7 +912,7 @@ int main(int argc, char* argv[]) {
         return wavtool(&data);
     }
     if (argc == 14) { // user wants the resampler mode
-        resampler_data data;
+        ms2_resampler_request data = {0};
         data.input = argv[1];
         data.output = argv[2];
         data.tone = note_to_frequency(argv[3]); // note is passed as a string (A4), so we need to convert it
@@ -789,8 +926,9 @@ int main(int argc, char* argv[]) {
         data.modulation = atoi(argv[11]);
         data.tempo = parse_tempo(argv[12]); //since tempo has a special format, we need to parse it
         data.pitch_curve = argv[13]; // pitch curve data as a string
-        return resample(&data);
+        return ms2_resample(&data);
     }
     printf("Invalid arguments. Expected 14 arguments, got %d.\n", argc);
     return 0;
 }
+#endif

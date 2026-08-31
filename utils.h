@@ -13,12 +13,15 @@ int write_conf(FILE* f, llsm_aoptions* conf);
 int read_conf(FILE* f, llsm_aoptions* opt);
 
 // Saves an llsm_chunk to an .llsm2 file. Returns 0 on success, -1 on failure.
-int save_llsm(llsm_chunk* chunk, const char* filename, llsm_aoptions* conf, int* fs, int* nbit);
+int save_llsm(llsm_chunk* chunk, const char* filename, llsm_aoptions* conf, int* fs, int* nbit, float alias_gain_db);
+
+float normalize_waveform(FP_TYPE *waveform, int length, FP_TYPE target_peak, int P_flag);
 
 char* build_llsm_path(const char* filename);
 
 // Reads an .llsm2 file and returns an llsm_chunk. Returns NULL on failure.
-llsm_chunk* read_llsm(const char* filename, int* nfrm, int* fs, int* nbit);
+llsm_chunk* read_llsm(const char* filename, int* nfrm, int* fs, int* nbit, float* alias_gain_db);
 
 // Gets an llsm_chunk, first reading if an llsm2 file exists, or analyzing the input audio if not. Returns NULL on failure.
-llsm_chunk* get_chunk_from_file(const char* filename, int* nfrm, int* fs, int* nbit, int* nx, int* nhop, int nosave, llsm_aoptions* opt_a_out, llsm_soptions* opt_s_out);
+llsm_chunk* get_chunk_from_file(const char* filename, int* nfrm, int* fs, int* nbit,
+    int* nx, int* nhop, int nosave, int force_analysis, llsm_aoptions* opt_a_out);

@@ -1,6 +1,10 @@
 # moresampler2
 moresampler2, written in c, with libllsm2 support
 
+An optional managed bridge for OpenUtau's external-renderer discovery API is in
+[`OpenUtau/`](OpenUtau/). It embeds the native engine in one platform-specific
+DLL while preserving the standalone executable for normal resampler compatibility.
+
 Listen, I don't know c. If the code looks horrible, it prolly is, i just changed things till they worked, with a mix of chatgpt and screaming
 
 I can't guarntee that everthing works on mac and linux, i use windows almost exlusively

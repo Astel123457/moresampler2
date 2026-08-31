@@ -18,6 +18,14 @@ add_subdirectory(libs/libllsm)
 
 add_executable(moresampler2 moresampler2.c wavtool.c utils.c)
 
+add_library(moresampler2_engine SHARED moresampler2.c wavtool.c utils.c)
+set_target_properties(moresampler2_engine PROPERTIES OUTPUT_NAME moresampler2)
+target_compile_definitions(moresampler2_engine PRIVATE
+    MORESAMPLER2_NO_MAIN
+    MORESAMPLER2_BUILD_SHARED
+    MORESAMPLER2_VERSION="${PROJECT_VERSION_FROM_FILE}"
+)
+
 target_compile_definitions(moresampler2 PRIVATE
     MORESAMPLER2_VERSION="${PROJECT_VERSION_FROM_FILE}"
 )
@@ -29,11 +37,26 @@ target_link_libraries(moresampler2 PRIVATE
     gvps
 )
 
+target_link_libraries(moresampler2_engine PRIVATE
+    llsm
+    ciglet
+    pyin
+    gvps
+)
+
 if(NOT WIN32)
     target_link_libraries(moresampler2 PRIVATE m)
+    target_link_libraries(moresampler2_engine PRIVATE m)
 endif()
 
 target_include_directories(moresampler2 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/libs/libllsm
+    ${CMAKE_CURRENT_SOURCE_DIR}/libs/ciglet
+    ${CMAKE_CURRENT_SOURCE_DIR}/libs/libpyin
+    ${CMAKE_CURRENT_SOURCE_DIR}/libs/libgvps
+)
+
+target_include_directories(moresampler2_engine PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/libllsm
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/ciglet
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/libpyin
