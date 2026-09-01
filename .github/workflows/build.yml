@@ -20,6 +20,11 @@ on:
           - release
           - beta
 
+env:
+  # Switch these to openutau/OpenUtau and master after PR 2340 is merged.
+  OPENUTAU_REPOSITORY: Astel123457/OpenUtau
+  OPENUTAU_REF: external-renderer-api
+
 jobs:
   version:
     runs-on: ubuntu-latest
@@ -31,7 +36,7 @@ jobs:
       prerelease: ${{ steps.version.outputs.prerelease }}
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Calculate version
         id: version
@@ -82,24 +87,37 @@ jobs:
           - os: ubuntu
             arch: x64
             runner: ubuntu-latest
+            native_library: build/libmoresampler2.so
           - os: ubuntu
             arch: arm64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04-arm
+            native_library: build/libmoresampler2.so
           - os: windows
             arch: x64
             runner: windows-latest
+            native_library: build/Release/moresampler2.dll
           - os: windows
             arch: arm64
-            runner: windows-latest
+            runner: windows-11-arm
+            native_library: build/Release/moresampler2.dll
           - os: macos
             arch: x64
-            runner: macos-latest
+            runner: macos-15-intel
+            native_library: build/libmoresampler2.dylib
           - os: macos
             arch: arm64
             runner: macos-latest
+            native_library: build/libmoresampler2.dylib
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+
+      - name: Check out OpenUtau renderer API
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.OPENUTAU_REPOSITORY }}
+          ref: ${{ env.OPENUTAU_REF }}
+          path: openutau-source
 
       - name: Use calculated version
         run: echo "${{ needs.version.outputs.version }}" > VERSION
@@ -107,15 +125,30 @@ jobs:
       - name: Set up CMake
         uses: jwlawson/actions-setup-cmake@v1.12
 
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
       - name: Configure CMake
         run: >
           cmake -B build -DCMAKE_BUILD_TYPE=Release
           ${{ matrix.os == 'windows' && matrix.arch == 'arm64' && '-A ARM64' || '' }}
           ${{ matrix.os == 'windows' && matrix.arch == 'x64' && '-A x64' || '' }}
-          ${{ matrix.os != 'windows' && matrix.arch == 'arm64' && '-DCMAKE_OSX_ARCHITECTURES=arm64' || '' }}
 
       - name: Build
         run: cmake --build build --config Release
+
+      - name: Verify native renderer library
+        shell: bash
+        run: test -f "${{ matrix.native_library }}"
+
+      - name: Build OpenUtau renderer
+        shell: bash
+        run: >
+          dotnet build OpenUtau/Moresampler2.OpenUtau.csproj
+          --configuration Release
+          -p:OpenUtauCoreProject="${{ github.workspace }}/openutau-source/OpenUtau.Core/OpenUtau.Core.csproj"
 
       - name: Package binary Windows
         if: matrix.os == 'windows'
@@ -123,8 +156,9 @@ jobs:
         run: |
           mkdir output
           Copy-Item build\Release\moresampler2.exe output\
+          Copy-Item OpenUtau\bin\Release\net10.0\Moresampler2.OpenUtau.dll output\
           cd output
-          Compress-Archive -Path moresampler2.exe -DestinationPath moresampler2-${{ matrix.os }}-${{ matrix.arch }}.zip
+          Compress-Archive -Path moresampler2.exe,Moresampler2.OpenUtau.dll -DestinationPath moresampler2-${{ matrix.os }}-${{ matrix.arch }}.zip
 
       - name: Package binary Non-Windows
         if: matrix.os != 'windows'
@@ -132,8 +166,9 @@ jobs:
         run: |
           mkdir output
           cp build/moresampler2 output/
+          cp OpenUtau/bin/Release/net10.0/Moresampler2.OpenUtau.dll output/
           cd output
-          zip moresampler2-${{ matrix.os }}-${{ matrix.arch }}.zip moresampler2
+          zip moresampler2-${{ matrix.os }}-${{ matrix.arch }}.zip moresampler2 Moresampler2.OpenUtau.dll
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
