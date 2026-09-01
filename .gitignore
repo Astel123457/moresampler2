@@ -32,6 +32,8 @@
 *.app
 
 build/
+**/bin/
+**/obj/
 *.cmake
 CMakeFiles/
 *.ini
