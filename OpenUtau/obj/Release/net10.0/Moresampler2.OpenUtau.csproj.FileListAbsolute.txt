@@ -1,0 +1,13 @@
+/home/astelmurray/openutau/moresampler2/OpenUtau/obj/Release/net10.0/Moresampler2.OpenUtau.csproj.AssemblyReference.cache
+/home/astelmurray/openutau/moresampler2/OpenUtau/obj/Release/net10.0/Moresampler2.OpenUtau.GeneratedMSBuildEditorConfig.editorconfig
+/home/astelmurray/openutau/moresampler2/OpenUtau/obj/Release/net10.0/Moresampler2.OpenUtau.AssemblyInfoInputs.cache
+/home/astelmurray/openutau/moresampler2/OpenUtau/obj/Release/net10.0/Moresampler2.OpenUtau.AssemblyInfo.cs
+/home/astelmurray/openutau/moresampler2/OpenUtau/obj/Release/net10.0/Moresampler2.OpenUtau.csproj.CoreCompileInputs.cache
+/home/astelmurray/openutau/moresampler2/OpenUtau/obj/Release/net10.0/Moresampler2.OpenUtau.sourcelink.json
+/home/astelmurray/openutau/moresampler2/OpenUtau/bin/Release/net10.0/Moresampler2.OpenUtau.deps.json
+/home/astelmurray/openutau/moresampler2/OpenUtau/bin/Release/net10.0/Moresampler2.OpenUtau.dll
+/home/astelmurray/openutau/moresampler2/OpenUtau/bin/Release/net10.0/Moresampler2.OpenUtau.pdb
+/home/astelmurray/openutau/moresampler2/OpenUtau/obj/Release/net10.0/Moresampler2.OpenUtau.dll
+/home/astelmurray/openutau/moresampler2/OpenUtau/obj/Release/net10.0/refint/Moresampler2.OpenUtau.dll
+/home/astelmurray/openutau/moresampler2/OpenUtau/obj/Release/net10.0/Moresampler2.OpenUtau.pdb
+/home/astelmurray/openutau/moresampler2/OpenUtau/obj/Release/net10.0/ref/Moresampler2.OpenUtau.dll

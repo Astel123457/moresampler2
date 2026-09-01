@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <OpenUtauCoreProject Condition="'$(OpenUtauCoreProject)' == ''">..\..\OpenUtau\OpenUtau.Core\OpenUtau.Core.csproj</OpenUtauCoreProject>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(OpenUtauCoreProject)" Private="false" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="NAudio.Core" Version="2.2.1" />
+    <PackageReference Include="Serilog" Version="4.1.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="..\build\libmoresampler2.so" Condition="Exists('..\build\libmoresampler2.so')" LogicalName="Moresampler2.Native.libmoresampler2.so" />
+    <EmbeddedResource Include="..\build\libmoresampler2.dylib" Condition="Exists('..\build\libmoresampler2.dylib')" LogicalName="Moresampler2.Native.libmoresampler2.dylib" />
+    <EmbeddedResource Include="..\build\Release\moresampler2.dll" Condition="Exists('..\build\Release\moresampler2.dll')" LogicalName="Moresampler2.Native.moresampler2.dll" />
+  </ItemGroup>
+</Project>
