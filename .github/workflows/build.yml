@@ -82,6 +82,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu
@@ -121,9 +122,6 @@ jobs:
 
       - name: Use calculated version
         run: echo "${{ needs.version.outputs.version }}" > VERSION
-
-      - name: Set up CMake
-        uses: jwlawson/actions-setup-cmake@v1.12
 
       - name: Set up .NET
         uses: actions/setup-dotnet@v4
