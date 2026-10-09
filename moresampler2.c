@@ -18,7 +18,7 @@ const char* version = MORESAMPLER2_VERSION;
 
 int base64decoderForUtau(char x, char y)
 {
-	int ans1, ans2, ans;
+	int ans1 = -1, ans2 = -1, ans;
 
 	if(x=='+') ans1 = 62;
 	if(x=='/') ans1 = 63;
@@ -32,6 +32,7 @@ int base64decoderForUtau(char x, char y)
 	if(y>='A' && y <= 'Z') ans2 = y-65;
 	if(y>='a' && y <= 'z') ans2 = y-71;
 
+	if (ans1 < 0 || ans2 < 0) return -1;
 	ans = (ans1<<6) | ans2;
 	if(ans >= 2048) ans -= 4096;
 	return ans;
@@ -46,15 +47,18 @@ int getF0Contour(const char *input, double *output)
     
 
 	tmp = 0.0;
+	if (!input || !output) return -1;
 	while(input[i] != '\0')
 	{
 		if(input[i] == '#')
 		{ 
 			length = 0;
-			for(j = i+1;input[j]!='#';j++)
+			for(j = i+1; input[j] != '#' && input[j] != '\0'; j++)
 			{
+				if (!isdigit((unsigned char)input[j])) return -1;
 				length = length*10 + input[j]-'0';
 			}
+			if (input[j] != '#') return -1;
 			i = j+1;
 			for(j = 0;j < length;j++)
 			{
@@ -63,7 +67,9 @@ int getF0Contour(const char *input, double *output)
 		}
 		else
 		{
+			if (input[i + 1] == '\0') return -1;
 			tmp = base64decoderForUtau(input[i], input[i+1]);
+			if (tmp < 0) return -1;
 			output[count++] = tmp;
 			i+=2;
 		}
@@ -170,7 +176,24 @@ void convert_cents_to_hz_offset(const double* cents, int cents_len,
 }
 
 FP_TYPE* convert_env_to_vol_arr(int* p, int* v, int nfrm) {
-    return NULL; // TODO
+    if (!p || !v || nfrm <= 0) return NULL;
+    FP_TYPE* result = malloc(sizeof(FP_TYPE) * (size_t)nfrm);
+    if (!result) return NULL;
+    for (int frame = 0; frame < nfrm; ++frame) {
+        int segment = 0;
+        while (segment < 4 && frame > p[segment + 1]) ++segment;
+        int start = p[segment];
+        int end = p[segment + 1];
+        if (end <= start) result[frame] = (FP_TYPE)v[segment];
+        else {
+            FP_TYPE t = (FP_TYPE)(frame - start) / (FP_TYPE)(end - start);
+            if (t < 0) t = 0;
+            if (t > 1) t = 1;
+            result[frame] = (FP_TYPE)v[segment] * (1 - t) +
+                (FP_TYPE)v[segment + 1] * t;
+        }
+    }
+    return result;
 }
 
 // Remove frames [from, to] (inclusive) from a chunk without time-stretching.
@@ -541,7 +564,7 @@ static int ms2_process(const ms2_resampler_request* data,
     f0_curve[0] = 0;
     pit_len = 1;
   }
-  if (!pit_len) { free(f0_curve); return 1; }
+  if (pit_len <= 0) { free(f0_curve); return 1; }
 
   float velocity = (float)exp2(1 - data->velocity / 100.0f);
   Flags flags;
@@ -723,7 +746,7 @@ static int ms2_process(const ms2_resampler_request* data,
   llsm_output* out = llsm_synthesize(opt_s, chunk_new);
 
   if (!out || !out->y) {
-      printf("Failed to synthesize output: %d\n", out);
+      printf("Failed to synthesize output: %p\n", (void*)out);
       if (cache_chunk) llsm_delete_chunk(cache_chunk);
       return 1;
   }

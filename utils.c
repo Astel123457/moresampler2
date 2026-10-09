@@ -514,7 +514,7 @@ llsm_chunk* get_chunk_from_file(const char* filename, int* nfrm, int* fs, int* n
     if (!llsm_path) {
       printf("WARNING: Failed to build LLSM2 filename path. Analysis will proceed without caching.\n");
     }
-    FILE* llsm_file = fopen(llsm_path, "rb");
+    FILE* llsm_file = llsm_path ? fopen(llsm_path, "rb") : NULL;
 
     if (llsm_file && !force_analysis) {
       // File exists — use cached analysis
