@@ -288,7 +288,8 @@ int wavtool(wavtool_data* data) {
         : llsm_copy_container(input->conf);
     llsm_container_attach(conf, LLSM_CONF_NFRM,
         llsm_create_int(new_nfrm), llsm_delete_int, llsm_copy_int);
-    llsm_chunk* combined = llsm_create_chunk(conf, new_nfrm);
+    // Keep initialized frames for any uncovered gaps in the output timeline.
+    llsm_chunk* combined = llsm_create_chunk(conf, 1);
     llsm_delete_container(conf);
     if (!combined) {
         fprintf(stderr, "wavtool: failed to allocate combined chunk\n");
@@ -303,8 +304,10 @@ int wavtool(wavtool_data* data) {
     // Preserve the accumulated phrase. Traditional wavtool mode truncates its
     // overlap tail; phrase mode places requests on an absolute timeline.
     int copy_out = data->use_position ? nfrm_out : keep_out;
-    for (int i = 0; i < copy_out; i++)
+    for (int i = 0; i < copy_out; i++) {
+        llsm_delete_container(combined->frames[i]);
         combined->frames[i] = llsm_copy_container(out_chunk->frames[i]);
+    }
 
 
     // Overlap blend + input append
@@ -332,6 +335,7 @@ int wavtool(wavtool_data* data) {
                 float comp = 1.0f / norm;
                 apply_volume_to_frame(prev_frame, comp * 100.0f);
             }
+            llsm_delete_container(combined->frames[dst]);
             combined->frames[dst] = prev_frame;
             llsm_delete_container(env_in);
         } else {
@@ -402,6 +406,8 @@ int wavtool(wavtool_data* data) {
 
 struct wavtool_phrase {
     llsm_chunk* chunk;
+    // Keep fades separate from model parameters until stitching is complete.
+    float* envelope;
     int fs;
     int nbit;
 };
@@ -424,6 +430,7 @@ static llsm_container* silent_frame(const llsm_container* source) {
 
 int wavtool_phrase_add(wavtool_phrase* phrase, const llsm_chunk* input,
     int fs, int nbit, float gain_db, const wavtool_data* data) {
+    double profile_started = ms2_profile_time();
     if (!phrase || !input || !data) return 1;
     int* input_count_ptr = llsm_container_get(input->conf, LLSM_CONF_NFRM);
     if (!input_count_ptr || *input_count_ptr <= 0 || fs <= 0) return 1;
@@ -440,41 +447,66 @@ int wavtool_phrase_add(wavtool_phrase* phrase, const llsm_chunk* input,
         old_count = old_count_ptr ? *old_count_ptr : 0;
     }
     int new_count = max(old_count, destination_start + take);
+    char profile_detail[128];
+    snprintf(profile_detail, sizeof(profile_detail), "old_frames=%d new_frames=%d phone_frames=%d",
+        old_count, new_count, take);
     llsm_container* conf = phrase->chunk
         ? llsm_copy_container(phrase->chunk->conf)
         : llsm_copy_container((llsm_container*)input->conf);
     llsm_container_attach(conf, LLSM_CONF_NFRM,
         llsm_create_int(new_count), llsm_delete_int, llsm_copy_int);
-    llsm_chunk* combined = llsm_create_chunk(conf, new_count);
+    // Every slot is filled below; do not allocate frames only to replace them.
+    llsm_chunk* combined = llsm_create_chunk(conf, 0);
     llsm_delete_container(conf);
     if (!combined) return 1;
     for (int i = 0; i < old_count; ++i)
         combined->frames[i] = llsm_copy_container(phrase->chunk->frames[i]);
     for (int i = old_count; i < new_count; ++i)
         combined->frames[i] = silent_frame(input->frames[source_start]);
+    ms2_profile("stitch.copy_accumulated_phrase", profile_started, profile_detail);
 
     float* envelope = build_envelope(data, take, frame_ms);
     if (!envelope) {
         llsm_delete_chunk(combined);
         return 1;
     }
+    float* levels = (float*)calloc((size_t)new_count, sizeof(float));
+    if (!levels) {
+        free(envelope);
+        llsm_delete_chunk(combined);
+        return 1;
+    }
+    if (old_count) memcpy(levels, phrase->envelope, sizeof(float) * (size_t)old_count);
     int overlap = max(0, (int)roundf(data->ovr / frame_ms));
     for (int i = 0; i < take; ++i) {
         int destination = destination_start + i;
         llsm_container* next = llsm_copy_container(input->frames[source_start + i]);
         apply_gain_db_to_frame(next, gain_db);
-        apply_volume_to_frame(next, envelope[i]);
         if (destination < old_count && i < overlap) {
-            float alpha = (float)(i + 1) / max(1, overlap);
-            ms2_interp_llsm_frame(combined->frames[destination], next, alpha);
-            llsm_delete_container(next);
+            float previous = levels[destination];
+            float incoming = max(0.0f, envelope[i]);
+            float total = previous + incoming;
+            // The envelope already IS the crossfade. Interpolate unfaded models
+            // using its relative weights and apply the summed level only once.
+            if (previous <= 0) {
+                llsm_delete_container(combined->frames[destination]);
+                combined->frames[destination] = next;
+            } else {
+                if (incoming > 0)
+                    ms2_interp_llsm_frame(combined->frames[destination], next, incoming / total);
+                llsm_delete_container(next);
+            }
+            levels[destination] = total;
         } else {
             llsm_delete_container(combined->frames[destination]);
             combined->frames[destination] = next;
+            levels[destination] = max(0.0f, envelope[i]);
         }
     }
     free(envelope);
     if (phrase->chunk) llsm_delete_chunk(phrase->chunk);
+    free(phrase->envelope);
+    phrase->envelope = levels;
     phrase->chunk = combined;
     phrase->fs = fs;
     phrase->nbit = nbit;
@@ -484,11 +516,18 @@ int wavtool_phrase_add(wavtool_phrase* phrase, const llsm_chunk* input,
 int wavtool_phrase_synthesize(wavtool_phrase* phrase, float** samples,
     int* sample_count, int* sample_rate) {
     if (!phrase || !phrase->chunk || !samples || !sample_count || !sample_rate) return 1;
+    double started = ms2_profile_time();
     llsm_chunk* synthesis = llsm_copy_chunk(phrase->chunk);
+    int count = *(int*)llsm_container_get(synthesis->conf, LLSM_CONF_NFRM);
+    for (int i = 0; i < count; ++i)
+        apply_volume_to_frame(synthesis->frames[i], phrase->envelope[i]);
     llsm_chunk_phasepropagate(synthesis, 1);
+    ms2_profile("final.copy_envelopes_phase", started, NULL);
     llsm_soptions* options = llsm_create_soptions((FP_TYPE)phrase->fs);
     options->use_l1 = 1;
+    started = ms2_profile_time();
     llsm_output* output = llsm_synthesize(options, synthesis);
+    ms2_profile("final.llsm_synthesize", started, NULL);
     llsm_delete_soptions(options);
     llsm_delete_chunk(synthesis);
     if (!output || !output->y) {
@@ -510,5 +549,6 @@ int wavtool_phrase_synthesize(wavtool_phrase* phrase, float** samples,
 void wavtool_phrase_delete(wavtool_phrase* phrase) {
     if (!phrase) return;
     if (phrase->chunk) llsm_delete_chunk(phrase->chunk);
+    free(phrase->envelope);
     free(phrase);
 }

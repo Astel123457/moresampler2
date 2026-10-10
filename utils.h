@@ -1,5 +1,15 @@
 #include <stdio.h>
 #include <llsm.h>
+#include "moresampler2.h"
+
+double ms2_profile_time(void);
+void ms2_profile(const char* stage, double started, const char* detail);
+int ms2_chunk_is_layer1(llsm_chunk* chunk);
+int ms2_prepare_layer1(llsm_chunk* chunk);
+llsm_chunk* read_llsm_options(const char* filename, int* nfrm, int* fs, int* nbit,
+    float* gain, llsm_aoptions* options);
+int ms2_save_analysis(llsm_chunk* chunk, const char* filename, llsm_aoptions* options,
+    int* fs, int* bits);
 
 #define LOG2DB (20.0 / 2.3025851)
 #define mag2db(x) (log_2(x) * LOG2DB)
@@ -25,3 +35,6 @@ llsm_chunk* read_llsm(const char* filename, int* nfrm, int* fs, int* nbit, float
 // Gets an llsm_chunk, first reading if an llsm2 file exists, or analyzing the input audio if not. Returns NULL on failure.
 llsm_chunk* get_chunk_from_file(const char* filename, int* nfrm, int* fs, int* nbit,
     int* nx, int* nhop, int nosave, int force_analysis, llsm_aoptions* opt_a_out);
+llsm_chunk* get_chunk_config(const char* filename, int* nfrm, int* fs, int* nbit,
+    int* nx, int* nhop, int nosave, int force_analysis, llsm_aoptions* options,
+    const ms2_analysis_settings* settings);

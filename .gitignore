@@ -36,4 +36,6 @@ build/
 **/obj/
 *.cmake
 CMakeFiles/
+moresampler_decomp/
+tests/
 *.ini

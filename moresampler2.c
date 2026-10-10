@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <ctype.h>
+#include <sys/stat.h>
 #include "utils.h"
 #include "wavtool.h"
 #include "moresampler2.h"
@@ -173,164 +174,97 @@ FP_TYPE* convert_env_to_vol_arr(int* p, int* v, int nfrm) {
     return NULL; // TODO
 }
 
-// Remove frames [from, to] (inclusive) from a chunk without time-stretching.
-// The head of the chunk (preutterance area) is preserved unchanged.
-static int remove_frame_range(llsm_chunk** io_chunk, int* io_nfrm, int from, int to) {
-  if (!io_chunk || !*io_chunk || !io_nfrm) return 0;
-  int old_nfrm = *io_nfrm;
-  if (from < 0 || to >= old_nfrm || from > to) return 0;
-  int del_count = to - from + 1;
-  int new_nfrm  = old_nfrm - del_count;
-  if (new_nfrm < 1) return 0;
+// Port of generate_time_mapping in the original 00413cd0 decompilation:
+// output knots [0, fixed * velocity_ratio, duration] map to source knots
+// [offset, offset + fixed, end]. Keep the velocity knot even when it lies
+// beyond the output: a short note then contains only part of the consonant.
+// Coordinates are in frames, but the knots retain fractional frame timing.
+static llsm_chunk* map_resampler_frames(llsm_chunk* source, int output_frames,
+    double offset, double end, double fixed, double velocity_ratio,
+    double duration, int loop) {
+  int source_frames = *(int*)llsm_container_get(source->conf, LLSM_CONF_NFRM);
+  if (source_frames < 1 || output_frames < 1 || !isfinite(velocity_ratio) ||
+      velocity_ratio <= 0 || !isfinite(duration) || duration <= 0) return NULL;
+  offset = fmax(0, fmin(offset, source_frames - 1));
+  end = fmax(offset, fmin(end, source_frames));
+  fixed = fmax(0, fmin(fixed, end - offset));
+  double boundary = fixed * velocity_ratio;
+  double vowel = end - offset - fixed;
 
-  llsm_chunk* chunk = *io_chunk;
-  llsm_container* conf_new = llsm_copy_container(chunk->conf);
-  if (!conf_new) return 0;
-  llsm_container_attach(conf_new, LLSM_CONF_NFRM,
-    llsm_create_int(new_nfrm), llsm_delete_int, llsm_copy_int);
-  llsm_chunk* out = llsm_create_chunk(conf_new, new_nfrm);
-  llsm_delete_container(conf_new);
-  if (!out) return 0;
+  llsm_container* conf = llsm_copy_container(source->conf);
+  llsm_container_attach(conf, LLSM_CONF_NFRM, llsm_create_int(output_frames),
+    llsm_delete_int, llsm_copy_int);
+  llsm_chunk* out = llsm_create_chunk(conf, 0);
+  llsm_delete_container(conf);
+  if (!out) return NULL;
 
-  int dst = 0;
-  for (int i = 0; i < from; ++i, ++dst)
-    out->frames[dst] = llsm_copy_container(chunk->frames[i]);
-  for (int i = to + 1; i < old_nfrm; ++i, ++dst)
-    out->frames[dst] = llsm_copy_container(chunk->frames[i]);
-
-  llsm_delete_chunk(chunk);
-  *io_chunk = out;
-  *io_nfrm  = new_nfrm;
-  return 1;
+  for (int i = 0; i < output_frames; ++i) {
+    double position;
+    if (i < boundary) {
+      position = offset + i / velocity_ratio;
+    } else if (vowel <= 0 || duration <= boundary) {
+      position = end;
+    } else if (loop) {
+      // Original loop knots alternate between the vowel start and end.
+      double phase = fmod(i - boundary, 2 * vowel);
+      position = offset + fixed + (phase <= vowel ? phase : 2 * vowel - phase);
+    } else {
+      position = offset + fixed + (i - boundary) * vowel / (duration - boundary);
+    }
+    position = fmax(offset, fmin(position, fmin(end, source_frames - 1)));
+    int base = (int)floor(position);
+    int next = min(base + 1, source_frames - 1);
+    FP_TYPE fraction = (FP_TYPE)(position - base);
+    out->frames[i] = llsm_copy_container(source->frames[base]);
+    if (!out->frames[i]) {
+      llsm_delete_chunk(out);
+      return NULL;
+    }
+    if (next > base && fraction > 0)
+      ms2_interp_llsm_frame(out->frames[i], source->frames[next], fraction);
+  }
+  return out;
 }
 
-int apply_stretch_to_chunk_range_resize(
-  llsm_chunk** io_chunk,
-  int* io_nfrm,
-  int frame_start,
-  int frame_end,
-  float ratio
-) {
-  if (!io_chunk || !*io_chunk || !io_nfrm || ratio <= 0.0f || frame_end < frame_start) return 0;
+// Tension is a layer-1 source control. Moresampler's Mt path alters the LF
+// source model while rebuilding a frame; libllsm2 exposes the equivalent
+// source-shape parameter as Rd. A smaller Rd is tenser/pressed and a larger Rd
+// is softer/breathier. Keep a modest tract tilt as the audible spectral part
+// of Mt, but do not approximate the entire control with VTMAGN alone.
+static void apply_tension_frame(llsm_container* frame, FP_TYPE tension) {
+    if (!frame || tension == 0) return;
+    if (tension > (FP_TYPE)100.0) tension = (FP_TYPE)100.0;
+    if (tension < (FP_TYPE)-100.0) tension = (FP_TYPE)-100.0;
+    const FP_TYPE t = tension / (FP_TYPE)100.0;
+    const FP_TYPE slope_db = (FP_TYPE)12.0 * t;
 
-  llsm_chunk* chunk = *io_chunk;
-  int old_nfrm = *io_nfrm;
-  if (old_nfrm <= 0) return 0;
-
-  int old_len = frame_end - frame_start + 1;
-  if (old_len < 1) return 0;
-
-  int new_len = (int)lroundf((float)old_len * ratio);
-  if (new_len < 1) new_len = 1;
-  int new_nfrm = old_nfrm + (new_len - old_len);
-  if (new_nfrm < 1) return 0;
-
-  llsm_container* conf_new = llsm_copy_container(chunk->conf);
-  if (!conf_new) return 0;
-  llsm_container_attach(conf_new, LLSM_CONF_NFRM, llsm_create_int(new_nfrm), llsm_delete_int, llsm_copy_int);
-
-  llsm_chunk* out = llsm_create_chunk(conf_new, new_nfrm);
-  llsm_delete_container(conf_new);
-  if (!out) return 0;
-
-  int dst = 0;
-  for (int i = 0; i < frame_start; ++i, ++dst) {
-    out->frames[dst] = llsm_copy_container(chunk->frames[i]);
-    if (!out->frames[dst]) {
-      llsm_delete_chunk(out);
-      return 0;
-    }
-  }
-
-  for (int i = 0; i < new_len; ++i, ++dst) {
-    FP_TYPE mapped = (new_len > 1)
-      ? (FP_TYPE)i * (FP_TYPE)(old_len - 1) / (FP_TYPE)(new_len - 1)
-      : (FP_TYPE)0;
-    int base = frame_start + (int)floor((double)mapped);
-    FP_TYPE frac = mapped - (FP_TYPE)floor((double)mapped);
-    if (base < frame_start) base = frame_start;
-    if (base > frame_end) base = frame_end;
-    int nxt = min(base + 1, frame_end);
-
-    out->frames[dst] = llsm_copy_container(chunk->frames[base]);
-    if (!out->frames[dst]) {
-      llsm_delete_chunk(out);
-      return 0;
+    FP_TYPE* rd = (FP_TYPE*)llsm_container_get(frame, LLSM_FRAME_RD);
+    if (rd && *rd > 0) {
+        FP_TYPE shaped = *rd * (FP_TYPE)pow(2.0, (double)-t);
+        if (shaped < (FP_TYPE)0.3) shaped = (FP_TYPE)0.3;
+        if (shaped > (FP_TYPE)3.0) shaped = (FP_TYPE)3.0;
+        *rd = shaped;
     }
 
-    if (nxt > base && frac > (FP_TYPE)1e-6) {
-      ms2_interp_llsm_frame(out->frames[dst], chunk->frames[nxt], frac);
-      FP_TYPE* resvec = (FP_TYPE*)llsm_container_get(chunk->frames[base], LLSM_FRAME_PSDRES);
-      if (resvec != NULL) {
-        llsm_container_attach(out->frames[dst], LLSM_FRAME_PSDRES, llsm_copy_fparray(resvec), llsm_delete_fparray, llsm_copy_fparray);
-      }
+    FP_TYPE* vt = (FP_TYPE*)llsm_container_get(frame, LLSM_FRAME_VTMAGN);
+    if (!vt) {
+        llsm_container_remove(frame, LLSM_FRAME_HM);
+        return;
     }
-  }
-
-  for (int i = frame_end + 1; i < old_nfrm; ++i, ++dst) {
-    out->frames[dst] = llsm_copy_container(chunk->frames[i]);
-    if (!out->frames[dst]) {
-      llsm_delete_chunk(out);
-      return 0;
-    }
-  }
-
-  llsm_delete_chunk(chunk);
-  *io_chunk = out;
-  *io_nfrm = new_nfrm;
-  return 1;
-}
-
-// velocity is the pre-computed vRatio = exp2(1 - raw_velocity/100):
-//   raw=0   → vRatio=2.0 (consonant 2x longer, slow heavy attack)
-//   raw=100 → vRatio=1.0 (unchanged)
-//   raw=200 → vRatio=0.5 (consonant halved, fast light attack)
-// total_frames_cap: output consonant must leave at least one vowel frame.
-void apply_velocity(llsm_chunk** io_chunk, int* io_nfrm, float velocity,
-                    int total_frames_cap, int* consonant_frames) {
-    int consonant_frames_old = *consonant_frames;
-
-    if (*io_nfrm <= consonant_frames_old + 1) {
-        printf("main_resampler: error applying velocity, no velocity applied.\n");
+    int nspec = llsm_fparray_length(vt);
+    if (nspec < 2) {
+        llsm_container_remove(frame, LLSM_FRAME_HM);
         return;
     }
 
-    int consonant_frames_new = (int)(consonant_frames_old * velocity + 0.5f);
-    if (consonant_frames_new < 1) consonant_frames_new = 1;
-    // Cap: consonant must leave room for at least one vowel frame in the output.
-    if (consonant_frames_new >= total_frames_cap) consonant_frames_new = total_frames_cap - 1;
-
-    if (consonant_frames_new == consonant_frames_old) return;
-
-    *consonant_frames = consonant_frames_new;
-    float consonant_ratio = (float)consonant_frames_new / (float)consonant_frames_old;
-    apply_stretch_to_chunk_range_resize(io_chunk, io_nfrm, 0, consonant_frames_old - 1, consonant_ratio);
-}
-
-// according to my research on the tension parameter in Synthesizer V,
-// as tension increases, the higher harmonics are amplified
-// and as tension decreases, they are attenuated.
-// Apply spectral tilt to the vocal-tract magnitude response (Layer 1 VTMAGN).
-// tension in [-100, 100]: positive = brighter (boost highs), negative = darker.
-// VTMAGN is in dB, so a linear tilt is a simple add.
-static void apply_tension_frame(llsm_container* frame, FP_TYPE tension) {
-    if (!frame || tension == 0) return;
-    // Map [-100,100] -> [-1,1], scale to +-24 dB peak tilt
-    const FP_TYPE t = tension / (FP_TYPE)100.0;
-    const FP_TYPE slope_db = (FP_TYPE)24.0 * t;
-
-        FP_TYPE* vt = (FP_TYPE*)llsm_container_get(frame, LLSM_FRAME_VTMAGN);
-        if (!vt) return;
-        int nspec = llsm_fparray_length(vt);
-        if (nspec < 2) return;
-
-        // Linear tilt centred at midpoint:
-        //   bin 0 (DC)   gets -slope_db/2
-        //   bin nspec-1  gets +slope_db/2
-        for (int j = 0; j < nspec; ++j) {
-            FP_TYPE w = (FP_TYPE)j / (FP_TYPE)(nspec - 1); // 0..1
-            vt[j] += slope_db * (w - (FP_TYPE)0.5);
-        }
+    // Linear tilt centred at midpoint:
+    //   bin 0 (DC)   gets -slope_db/2
+    //   bin nspec-1  gets +slope_db/2
+    for (int j = 0; j < nspec; ++j) {
+        FP_TYPE w = (FP_TYPE)j / (FP_TYPE)(nspec - 1); // 0..1
+        vt[j] += slope_db * (w - (FP_TYPE)0.5);
+    }
+    llsm_container_remove(frame, LLSM_FRAME_HM);
 }
 
 static FP_TYPE curve_value(const float* curve, int length, int index, int count) {
@@ -342,8 +276,13 @@ static FP_TYPE curve_value(const float* curve, int length, int index, int count)
     return curve[left] * (1 - alpha) + curve[right] * alpha;
 }
 
+typedef struct {
+    int g, t, Y, e, b, A, P, u;
+    int Mt, Mb, Md, Mm, Ms, ME, Mo, Mr, MC, MG, MD, Mp;
+} Flags;
+
 void apply_tension(llsm_chunk* chunk, FP_TYPE tension) {
-    if (!chunk) return;
+    if (!chunk || tension == 0) return;
     int* nfrm_p = llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
     if (!nfrm_p) return;
     for (int i = 0; i < *nfrm_p; ++i)
@@ -360,7 +299,7 @@ void apply_tension_curve(llsm_chunk* chunk, const float* curve, int length) {
 
 
 static void apply_gender_frame(llsm_container* frame, FP_TYPE gender) {
-  if (!frame) return;
+  if (!frame || gender == 0) return;
   if (gender > (FP_TYPE)100.0) gender = (FP_TYPE)100.0;
   if (gender < (FP_TYPE)-100.0) gender = (FP_TYPE)-100.0;
   FP_TYPE ratio = (FP_TYPE)pow(2.0, (double)(gender / (FP_TYPE)100.0));
@@ -393,7 +332,7 @@ static void apply_gender_frame(llsm_container* frame, FP_TYPE gender) {
 }
 
 void apply_gender(llsm_chunk* chunk, FP_TYPE gender) {
-  if (!chunk) return;
+  if (!chunk || gender == 0) return;
   int* nfrm_p = llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
   if (!nfrm_p) return;
   for (int i = 0; i < *nfrm_p; ++i)
@@ -406,6 +345,223 @@ void apply_gender_curve(llsm_chunk* chunk, const float* curve, int length) {
   if (!nfrm_p) return;
   for (int i = 0; i < *nfrm_p; ++i)
     apply_gender_frame(chunk->frames[i], curve_value(curve, length, i, *nfrm_p));
+}
+
+static FP_TYPE effect_value(const float* curve, int length, int frame, int count, FP_TYPE fallback) {
+  return fallback + (curve && length > 0 ? curve_value(curve, length, frame, count) : 0);
+}
+
+static int curve_is_active(const float* curve, int length, float neutral) {
+  if (!curve) return 0;
+  for (int i = 0; i < length; ++i)
+    if (curve[i] != neutral) return 1;
+  return 0;
+}
+
+static int remaining_effects_active(const ms2_resampler_request* data, const Flags* flags) {
+  if (flags->Mb || flags->Md || flags->Mo || flags->ME || flags->Mr ||
+      flags->MG || flags->MC || flags->MD || flags->Mp || flags->b ||
+      flags->A || flags->Y != 100) return 1;
+  const float* curves[] = { data->breathiness_curve, data->mouth_curve,
+    data->formant_curve, data->singer_formant_curve, data->growl_curve,
+    data->growl_coarseness_curve, data->distortion_curve,
+    data->pitch_randomness_curve, data->unvoiced_emphasis_curve,
+    data->amplitude_modulation_curve, data->dryness_curve };
+  for (size_t i = 0; i < sizeof(curves) / sizeof(curves[0]); ++i)
+    if (curve_is_active(curves[i], data->expression_count, 0)) return 1;
+  return curve_is_active(data->voicing_curve, data->expression_count, 100);
+}
+
+static FP_TYPE clamp_fp(FP_TYPE value, FP_TYPE low, FP_TYPE high) {
+  return value < low ? low : (value > high ? high : value);
+}
+
+static void apply_noise_gain(llsm_nmframe* noise, FP_TYPE gain_db) {
+  if (!noise || gain_db == 0) return;
+  for (int i = 0; i < noise->npsd; ++i) noise->psd[i] += gain_db;
+  FP_TYPE linear = (FP_TYPE)pow(10.0, (double)(gain_db / 20));
+  for (int channel = 0; channel < noise->nchannel; ++channel) {
+    noise->edc[channel] *= linear;
+    llsm_hmframe* envelope = noise->eenv[channel];
+    if (!envelope) continue;
+    for (int harmonic = 0; harmonic < envelope->nhar; ++harmonic)
+      envelope->ampl[harmonic] *= linear;
+  }
+}
+
+static void warp_spectrum(FP_TYPE* spectrum, int count, FP_TYPE amount) {
+  if (!spectrum || count < 2 || amount == 0) return;
+  FP_TYPE ratio = (FP_TYPE)pow(2.0, (double)(amount / 200.0));
+  FP_TYPE* source = malloc(sizeof(FP_TYPE) * (size_t)count);
+  if (!source) return;
+  memcpy(source, spectrum, sizeof(FP_TYPE) * (size_t)count);
+  for (int i = 0; i < count; ++i) {
+    FP_TYPE position = (FP_TYPE)i / ratio;
+    if (position < 0) position = 0;
+    if (position > count - 1) position = count - 1;
+    int left = (int)position;
+    int right = min(count - 1, left + 1);
+    FP_TYPE fraction = position - left;
+    spectrum[i] = source[left] * (1 - fraction) + source[right] * fraction;
+  }
+  free(source);
+}
+
+static void apply_remaining_effects(llsm_chunk* chunk, const ms2_resampler_request* data,
+    const Flags* flags) {
+  if (!chunk || !remaining_effects_active(data, flags)) return;
+  int* count_ptr = llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
+  FP_TYPE* nyquist_ptr = llsm_container_get(chunk->conf, LLSM_CONF_FNYQ);
+  if (!count_ptr) return;
+  int count = *count_ptr;
+  FP_TYPE nyquist = nyquist_ptr ? *nyquist_ptr : (FP_TYPE)22050.0;
+  for (int frame_index = 0; frame_index < count; ++frame_index) {
+    llsm_container* frame = chunk->frames[frame_index];
+    if (!frame) continue;
+    FP_TYPE* vt = llsm_container_get(frame, LLSM_FRAME_VTMAGN);
+    llsm_nmframe* noise = llsm_container_get(frame, LLSM_FRAME_NM);
+    FP_TYPE* f0 = llsm_container_get(frame, LLSM_FRAME_F0);
+    int vt_count = vt ? llsm_fparray_length(vt) : 0;
+    FP_TYPE breath = effect_value(data->breathiness_curve, data->expression_count,
+      frame_index, count, flags->Mb);
+    FP_TYPE voicing = data->voicing_curve && data->expression_count > 0
+      ? curve_value(data->voicing_curve, data->expression_count, frame_index, count)
+      : (FP_TYPE)100.0;
+    voicing = clamp_fp(voicing, 0, 100);
+    FP_TYPE mouth = effect_value(data->mouth_curve, data->expression_count,
+      frame_index, count, flags->Mo);
+    FP_TYPE emphasis = effect_value(data->formant_curve, data->expression_count,
+      frame_index, count, flags->ME);
+    FP_TYPE singer_formant = effect_value(data->singer_formant_curve, data->expression_count,
+      frame_index, count, flags->Mr);
+    FP_TYPE growl = effect_value(data->growl_curve, data->expression_count,
+      frame_index, count, flags->MG);
+    FP_TYPE coarse = effect_value(data->growl_coarseness_curve, data->expression_count,
+      frame_index, count, flags->MC);
+    FP_TYPE distortion = effect_value(data->distortion_curve, data->expression_count,
+      frame_index, count, flags->MD);
+    FP_TYPE randomness = effect_value(data->pitch_randomness_curve, data->expression_count,
+      frame_index, count, flags->Mp);
+    FP_TYPE unvoiced_emphasis = effect_value(data->unvoiced_emphasis_curve,
+      data->expression_count, frame_index, count, flags->b);
+    FP_TYPE amplitude_modulation = effect_value(data->amplitude_modulation_curve,
+      data->expression_count, frame_index, count, flags->A);
+
+    warp_spectrum(vt, vt_count, mouth);
+    if (vt && vt_count > 2 && emphasis != 0) {
+      FP_TYPE* source = malloc(sizeof(FP_TYPE) * (size_t)vt_count);
+      if (source) {
+        memcpy(source, vt, sizeof(FP_TYPE) * (size_t)vt_count);
+        FP_TYPE strength = emphasis / 100;
+        for (int i = 1; i < vt_count - 1; ++i) {
+          FP_TYPE smooth = (source[i - 1] + source[i] + source[i + 1]) / 3;
+          vt[i] += (source[i] - smooth) * strength * 2;
+        }
+        free(source);
+      }
+    }
+    if (vt && vt_count > 1 && singer_formant != 0) {
+      FP_TYPE center = (FP_TYPE)3000.0 / nyquist;
+      FP_TYPE gain = singer_formant * (FP_TYPE)0.12;
+      for (int i = 0; i < vt_count; ++i) {
+        FP_TYPE x = (FP_TYPE)i / (vt_count - 1);
+        FP_TYPE distance = (x - center) / (FP_TYPE)0.08;
+        vt[i] += gain * (FP_TYPE)exp((double)(-0.5 * distance * distance));
+      }
+    }
+    FP_TYPE dryness = effect_value(data->dryness_curve, data->expression_count,
+      frame_index, count, flags->Md);
+    FP_TYPE noise_gain = breath * (FP_TYPE)0.12 - dryness * (FP_TYPE)0.12;
+    noise_gain += (100 - voicing) * (FP_TYPE)0.18;
+    noise_gain += (100 - flags->Y) * (FP_TYPE)0.10;
+    if (f0 && *f0 == 0) noise_gain += unvoiced_emphasis * (FP_TYPE)0.12;
+    apply_noise_gain(noise, noise_gain);
+    FP_TYPE amplitude_gain = 0;
+    if (f0 && *f0 > 0 && data->tone > 0 && amplitude_modulation != 0) {
+      FP_TYPE pitch_deviation_semitones = 12 * (FP_TYPE)(log(*f0 / data->tone) / log(2.0));
+      amplitude_gain = amplitude_modulation * (FP_TYPE)0.12 * pitch_deviation_semitones;
+    }
+    if (vt) {
+      FP_TYPE voiced_gain = -breath * (FP_TYPE)0.06;
+      voiced_gain -= max(max(breath, 0), coarse) * (FP_TYPE)0.04;
+      FP_TYPE rate = (FP_TYPE)(2.0 + coarse * 0.08);
+      FP_TYPE growl_gain = growl * (FP_TYPE)0.08 *
+        (FP_TYPE)sin(2.0 * M_PI * rate * frame_index / max(1, count));
+      for (int i = 0; i < vt_count; ++i) {
+        FP_TYPE normalized = vt_count > 1 ? (FP_TYPE)i / (vt_count - 1) : 0;
+        vt[i] += voiced_gain + growl_gain + amplitude_gain;
+        vt[i] += coarse * (FP_TYPE)0.035 *
+          (FP_TYPE)sin(2.0 * M_PI * (3.0 + coarse * 0.06) * normalized);
+        vt[i] += distortion * (FP_TYPE)0.04 *
+          (FP_TYPE)sin(2.0 * M_PI * (8.0 + normalized * 24.0) * frame_index / max(1, count));
+      }
+    }
+    if (f0 && *f0 > 0 && randomness > 0) {
+      unsigned hash = (unsigned)(frame_index + 1) * 1103515245u + 12345u;
+      FP_TYPE noise = ((hash >> 8) & 0xffff) / (FP_TYPE)32767.5 - 1;
+      *f0 *= (FP_TYPE)pow(2.0, (double)(noise * randomness * 0.15 / 12.0));
+    }
+    llsm_container_remove(frame, LLSM_FRAME_HM);
+  }
+}
+
+// Ms stabilizes analysis artifacts by smoothing layer-1 parameters over time.
+// Work from a snapshot so the filter is symmetric and does not drift forward.
+static void apply_stabilization(llsm_chunk* chunk, const ms2_resampler_request* data,
+    const Flags* flags) {
+  if (!chunk || (flags->Ms <= 0 &&
+      !curve_is_active(data->stability_curve, data->expression_count, 0))) return;
+  int* count_ptr = llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
+  if (!count_ptr || *count_ptr < 2) return;
+  int count = *count_ptr;
+  llsm_chunk* source = llsm_copy_chunk(chunk);
+  if (!source) return;
+  for (int frame_index = 0; frame_index < count; ++frame_index) {
+    FP_TYPE strength = effect_value(data->stability_curve, data->expression_count,
+      frame_index, count, flags->Ms);
+    strength = clamp_fp(strength, 0, 10);
+    if (strength <= 0) continue;
+    int radius = 1 + (int)(strength / 3);
+    FP_TYPE alpha = strength / 10;
+    llsm_container* dst = chunk->frames[frame_index];
+    FP_TYPE* dst_rd = llsm_container_get(dst, LLSM_FRAME_RD);
+    FP_TYPE* dst_vt = llsm_container_get(dst, LLSM_FRAME_VTMAGN);
+    llsm_nmframe* dst_noise = llsm_container_get(dst, LLSM_FRAME_NM);
+    int vt_count = dst_vt ? llsm_fparray_length(dst_vt) : 0;
+    FP_TYPE rd_sum = 0;
+    int rd_samples = 0;
+    FP_TYPE* vt_sum = vt_count > 0 ? calloc((size_t)vt_count, sizeof(FP_TYPE)) : NULL;
+    FP_TYPE* noise_sum = dst_noise && dst_noise->npsd > 0
+      ? calloc((size_t)dst_noise->npsd, sizeof(FP_TYPE)) : NULL;
+    int spectral_samples = 0;
+    for (int nearby = max(0, frame_index - radius);
+         nearby <= min(count - 1, frame_index + radius); ++nearby) {
+      llsm_container* src = source->frames[nearby];
+      FP_TYPE* src_rd = llsm_container_get(src, LLSM_FRAME_RD);
+      FP_TYPE* src_vt = llsm_container_get(src, LLSM_FRAME_VTMAGN);
+      llsm_nmframe* src_noise = llsm_container_get(src, LLSM_FRAME_NM);
+      if (dst_rd && src_rd && *src_rd > 0) { rd_sum += *src_rd; ++rd_samples; }
+      if (vt_sum && src_vt && llsm_fparray_length(src_vt) == vt_count &&
+          noise_sum && src_noise && src_noise->npsd == dst_noise->npsd) {
+        for (int i = 0; i < vt_count; ++i) vt_sum[i] += src_vt[i];
+        for (int i = 0; i < dst_noise->npsd; ++i) noise_sum[i] += src_noise->psd[i];
+        ++spectral_samples;
+      }
+    }
+    if (dst_rd && rd_samples > 0)
+      *dst_rd = *dst_rd * (1 - alpha) + rd_sum / rd_samples * alpha;
+    if (spectral_samples > 0) {
+      for (int i = 0; i < vt_count; ++i)
+        dst_vt[i] = dst_vt[i] * (1 - alpha) + vt_sum[i] / spectral_samples * alpha;
+      for (int i = 0; i < dst_noise->npsd; ++i)
+        dst_noise->psd[i] = dst_noise->psd[i] * (1 - alpha) +
+          noise_sum[i] / spectral_samples * alpha;
+    }
+    free(vt_sum);
+    free(noise_sum);
+    llsm_container_remove(dst, LLSM_FRAME_HM);
+  }
+  llsm_delete_chunk(source);
 }
 
 FP_TYPE* get_pitch_from_area(llsm_chunk* chunk, int start, int end) {
@@ -465,33 +621,43 @@ FP_TYPE* apply_modulation(FP_TYPE* pitch, int mod, int nfrm) {
   return modulated_pitch;
 }
 
-typedef struct {
-    int Mt;
-    int t;
-    int P;
-    int g;
-    int e; 
-} Flags;
-
 int clamp(int val, int min, int max) {
     return val < min ? min : (val > max ? max : val);
 }
 
 void parse_flag_string(const char* str, Flags* flags_out) {
-    flags_out->Mt = 0;
-    flags_out->t = 0;
+    memset(flags_out, 0, sizeof(*flags_out));
+    // Optional normalization is opt-in, just like the other effects.
     flags_out->P = 0;
-    flags_out->g = 0;
-    flags_out->e = 0;
+    flags_out->Y = 100;
+    flags_out->Mm = 100;
 
     const char* p = str;
     while (*p != '\0') {
         char* end;
-        if (strncmp(p, "Mt", 2) == 0) {
+        if (strncmp(p, "Me", 2) == 0) {
             p += 2;
-            flags_out->Mt = strtol(p, &end, 10);
-            p = end;
-            flags_out->Mt = clamp(flags_out->Mt, -100, 100);
+            flags_out->e = 1;
+        } else if (strncmp(p, "Mt", 2) == 0 || strncmp(p, "Mb", 2) == 0 ||
+            strncmp(p, "Md", 2) == 0 || strncmp(p, "Mm", 2) == 0 ||
+            strncmp(p, "Ms", 2) == 0 || strncmp(p, "ME", 2) == 0 ||
+            strncmp(p, "Mo", 2) == 0 || strncmp(p, "Mr", 2) == 0 ||
+            strncmp(p, "MC", 2) == 0 || strncmp(p, "MG", 2) == 0 ||
+            strncmp(p, "MD", 2) == 0 || strncmp(p, "Mp", 2) == 0) {
+            char a = p[1]; p += 2;
+            int value = (int)strtol(p, &end, 10); p = end;
+            if (a == 't') flags_out->Mt = clamp(value, -100, 100);
+            else if (a == 'b') flags_out->Mb = clamp(value, -100, 100);
+            else if (a == 'd') flags_out->Md = clamp(value, -100, 100);
+            else if (a == 'm') flags_out->Mm = clamp(value, 0, 100);
+            else if (a == 's') flags_out->Ms = clamp(value, 0, 10);
+            else if (a == 'E') flags_out->ME = clamp(value, -100, 100);
+            else if (a == 'o') flags_out->Mo = clamp(value, -100, 100);
+            else if (a == 'r') flags_out->Mr = clamp(value, -100, 100);
+            else if (a == 'C') flags_out->MC = clamp(value, 0, 100);
+            else if (a == 'G') flags_out->MG = clamp(value, 0, 100);
+            else if (a == 'D') flags_out->MD = clamp(value, 0, 100);
+            else if (a == 'p') flags_out->Mp = clamp(value, 0, 100);
         } else if (*p == 't') {
             p++;
             flags_out->t = strtol(p, &end, 10);
@@ -509,7 +675,14 @@ void parse_flag_string(const char* str, Flags* flags_out) {
             flags_out->g = clamp(flags_out->g, -100, 100);
         } else if (*p == 'e') {
             p++;
-            flags_out->e = 1;
+            flags_out->e = 0;
+        } else if (*p == 'b' || *p == 'A' || *p == 'Y') {
+            char name = *p++; int value = (int)strtol(p, &end, 10); p = end;
+            if (name == 'b') flags_out->b = clamp(value, -20, 100);
+            else if (name == 'A') flags_out->A = clamp(value, -100, 100);
+            else flags_out->Y = clamp(value, 0, 100);
+        } else if (*p == 'u') {
+            p++; flags_out->u = 1;
         } else {
             p++;
         }
@@ -526,6 +699,8 @@ int parse_tempo(const char *tempo_str) {
 static int ms2_process(const ms2_resampler_request* data,
     llsm_chunk** phrase_chunk, float* phrase_gain_db,
     int* phrase_fs, int* phrase_nbit) {
+  double profile_started = ms2_profile_time();
+  ms2_profile("phone.begin", profile_started, data->input);
   // Allocate and load pitch curve
   int direct_pitch_count = data->pitch_values && data->pitch_value_count > 0
     ? data->pitch_value_count : 0;
@@ -554,8 +729,16 @@ static int ms2_process(const ms2_resampler_request* data,
   int fs = 0, nbit = 0, nx = 0;
   int nfrm = 0;
 
-  llsm_chunk* chunk = get_chunk_from_file(data->input, &nfrm, &fs, &nbit,
-    &nx, &nhop, 0, 0, opt_a);
+  double load_started = ms2_profile_time();
+  llsm_chunk* chunk;
+  if (data->analysis_file && data->analysis_file[0]) {
+    chunk = read_llsm_options(data->analysis_file, &nfrm, &fs, &nbit, NULL, opt_a);
+    ms2_profile(chunk ? "analysis.cache_hit" : "analysis.cache_invalid", load_started, data->analysis_file);
+    if (chunk && !ms2_chunk_is_layer1(chunk)) { llsm_delete_chunk(chunk); chunk = NULL; }
+  } else {
+    chunk = get_chunk_from_file(data->input, &nfrm, &fs, &nbit,
+      &nx, &nhop, 0, 0, opt_a);
+  }
   if (!chunk) {
     free(f0_curve);
     return 1;
@@ -573,19 +756,18 @@ static int ms2_process(const ms2_resampler_request* data,
       end_frame = nfrm - (int)round((data->cutoff / 1000.0) * fs / nhop);
   }
   if (start_frame < 0) start_frame = 0;
+  if (start_frame >= nfrm) start_frame = nfrm - 1;
   if (end_frame > nfrm) end_frame = nfrm;
   if (end_frame <= start_frame) end_frame = start_frame + 1;
 
   
-  // Calculate consonant frames (unstretched)
-  int consonant_frames = (int)round((data->consonant / 1000.0) * fs / nhop);
-  if (consonant_frames > end_frame - start_frame)
-      consonant_frames = end_frame - start_frame;
   int sample_frames = end_frame - start_frame;
-  // Calculate total output frames to match data->length (ms)
-  int total_frames = (int)round((data->length / 1000.0) * fs / nhop);
-  if (total_frames < consonant_frames) total_frames = consonant_frames + 1;
-  
+  double frames_per_ms = fs / (1000.0 * nhop);
+  double output_duration = data->length * frames_per_ms;
+  int total_frames = (int)round(output_duration);
+  if (total_frames < 1) total_frames = 1;
+  if (output_duration <= 0) output_duration = 1;
+
   float* f0_array = malloc(sizeof(float) * total_frames);
   if (!f0_array) {
     // Handle out-of-memory error
@@ -596,93 +778,36 @@ static int ms2_process(const ms2_resampler_request* data,
     return 1;
   }
 
-  FP_TYPE* mod_pitch = apply_modulation(interp_pitch_to_pitd(get_pitch_from_area(chunk, start_frame, end_frame), sample_frames, total_frames), data->modulation, total_frames);
+  FP_TYPE* mod_pitch = data->modulation == 0
+    ? calloc((size_t)total_frames, sizeof(FP_TYPE))
+    : apply_modulation(interp_pitch_to_pitd(get_pitch_from_area(chunk, start_frame, end_frame), sample_frames, total_frames), data->modulation, total_frames);
   
   convert_cents_to_hz_offset(f0_curve, pit_len, total_frames, nhop, fs, data->tempo, f0_array);
   printf("pit_len: %d, total_frames: %d\n", pit_len, total_frames);
-  for (int i = 0; i < total_frames; ++i) {
-    f0_array[i] *= pow(2.0f, (double)flags.t/120);
+  // Convert and synchronize the complete source before mapping. Truncating it
+  // to output length first loses frames needed by fast consonants/short notes.
+  double stage_started = ms2_profile_time();
+  // Source caches are already L1; do not repeat glottal/spectral analysis.
+  llsm_chunk_phasepropagate(chunk, -1);
+  ms2_profile("phone.source_layer1_phase", stage_started, data->input);
+  stage_started = ms2_profile_time();
+  double source_end = data->cutoff < 0
+    ? (data->offset - data->cutoff) * frames_per_ms
+    : nfrm - data->cutoff * frames_per_ms;
+  llsm_chunk* chunk_new = map_resampler_frames(chunk, total_frames,
+    data->offset * frames_per_ms, source_end,
+    data->consonant * frames_per_ms, velocity, output_duration, flags.e == 1);
+  if (!chunk_new) {
+    free(f0_array);
+    free(mod_pitch);
+    free(f0_curve);
+    llsm_delete_chunk(chunk);
+    llsm_delete_aoptions(opt_a);
+    llsm_delete_soptions(opt_s);
+    return 1;
   }
-  llsm_container* conf_new = llsm_copy_container(chunk -> conf);
-  llsm_container_attach(conf_new, LLSM_CONF_NFRM,
-    llsm_create_int(total_frames), llsm_delete_int, llsm_copy_int);
-  llsm_chunk* chunk_new = llsm_create_chunk(conf_new, 1);
-  llsm_delete_container(conf_new);
-  int no_stretch = 0;
-  
-  // Copy consonant area directly
-  if (total_frames <= sample_frames) {
-    for (int i = 0; i < total_frames; i++) {
-      chunk_new->frames[i] = llsm_copy_container(chunk->frames[start_frame + i]);
-    }
-    no_stretch = 1;
-  } else {
-    for (int i = 0; i < sample_frames; i++) {
-      chunk_new->frames[i] = llsm_copy_container(chunk->frames[start_frame + i]);
-    }
-  }
-  llsm_chunk_tolayer1(chunk_new, 2048);
-  llsm_chunk_phasepropagate(chunk_new, -1);
-
-  // chunk_nfrm tracks the actual number of filled frames in chunk_new;
-  // total_frames is the desired output length and must not change.
-  // When total_frames <= sample_frames the early copy only fills total_frames
-  // slots; using sample_frames here would cause the later no_stretch path to
-  // inflate total_frames past the allocated array size and crash.
-  int orig_total_frames = total_frames; // UTAU-requested output length; never exceed this
-  int chunk_nfrm = (total_frames < sample_frames) ? total_frames : sample_frames;
-  if (data->velocity != 100.0f) {
-      apply_velocity(&chunk_new, &chunk_nfrm, velocity, orig_total_frames, &consonant_frames);
-  }
-  // recalculate if we need to stretch the vowel area
-  int vowel_sample_frames = chunk_nfrm - consonant_frames;
-  int vowel_total_frames  = total_frames - consonant_frames;
-
-  if (vowel_sample_frames <= 0 || vowel_total_frames <= 0 || vowel_sample_frames >= vowel_total_frames) {
-    no_stretch = 1;
-    // Only shrink total_frames if the sample is shorter than the requested length.
-    // After consonant stretching, chunk_nfrm can exceed orig_total_frames; in that
-    // case we keep total_frames at orig_total_frames so f0_array is never overrun.
-    total_frames = (chunk_nfrm < orig_total_frames) ? chunk_nfrm : orig_total_frames;
-  } else {
-    no_stretch = 0;
-  }
-  
-  // Stretch or loop the vowel area
-  if (no_stretch == 0) {
-    if (flags.e == 1) {
-      printf("looping enabled\n");
-      // Loop the vowel area instead of stretching
-      int vowel_start = consonant_frames;
-      int vowel_end = consonant_frames + vowel_sample_frames - 1;
-      int frames_to_fill = vowel_total_frames;
-      int dst_frame = vowel_start;
-      int loop_count = 0;
-      
-      // Copy frames by looping the vowel area until we have enough frames
-      while (dst_frame < consonant_frames + frames_to_fill && loop_count < 1000) {
-        for (int i = vowel_start; i <= vowel_end && dst_frame < consonant_frames + frames_to_fill; i++) {
-          chunk_new->frames[dst_frame] = llsm_copy_container(chunk_new->frames[i]);
-          dst_frame++;
-        }
-        loop_count++;
-      }
-    } else {
-      // Stretch the vowel area; tell the function the current chunk size first
-      total_frames = chunk_nfrm;
-      float stretch_ratio = (float)vowel_total_frames / (float)vowel_sample_frames;
-      apply_stretch_to_chunk_range_resize(&chunk_new, &total_frames, consonant_frames, consonant_frames + vowel_sample_frames - 1, stretch_ratio);
-      // total_frames is now restored to its original value
-    }
-  }
-  // Sync the chunk conf with the final output frame count so that
-  // llsm_synthesize processes exactly total_frames frames.  The chunk may
-  // have more frames allocated (e.g. after consonant time-stretching) but
-  // the extras are simply unused and freed by llsm_delete_chunk later.
-  {
-    int* p = llsm_container_get(chunk_new->conf, LLSM_CONF_NFRM);
-    if (p) *p = total_frames;
-  }
+  ms2_profile("phone.time_mapping", stage_started, data->input);
+  stage_started = ms2_profile_time();
   // Set all f0 to target tone
   for(int i = 0; i < total_frames; i ++) {
     llsm_container_attach(chunk_new->frames[i], LLSM_FRAME_HM, NULL, NULL, NULL);
@@ -693,7 +818,7 @@ static int ms2_process(const ms2_resampler_request* data,
       continue;
     }
     else {
-      f0_i[0] = data->tone * (1.0 + f0_array[i]);
+      f0_i[0] = data->tone * pow(2.0f, (double)flags.t / 1200.0) * (1.0 + f0_array[i]);
       f0_i[0] += mod_pitch[i];
       if (f0_i[0] < 20.0f && f0_i[0] != 0.0f) f0_i[0] = 20.0f; // minimum F0
     }
@@ -707,41 +832,58 @@ static int ms2_process(const ms2_resampler_request* data,
     }
     
   }
-  if (data->gender_curve && data->expression_count > 0)
+  free(f0_array);
+  free(mod_pitch);
+  apply_gender(chunk_new, flags.g);
+  if (curve_is_active(data->gender_curve, data->expression_count, 0))
     apply_gender_curve(chunk_new, data->gender_curve, data->expression_count);
-  else
-    apply_gender(chunk_new, flags.g);
-  if (data->tension_curve && data->expression_count > 0)
+  apply_tension(chunk_new, flags.Mt);
+  if (curve_is_active(data->tension_curve, data->expression_count, 0))
     apply_tension_curve(chunk_new, data->tension_curve, data->expression_count);
-  else
-    apply_tension(chunk_new, flags.Mt); // spectral tilt on VTMAGN while still Layer 1
-  llsm_chunk* cache_chunk = llsm_copy_chunk(chunk_new);
-  llsm_chunk_tolayer0(chunk_new);
-  llsm_chunk_phasepropagate(chunk_new, 1);
-  printf("Synthesis\n");
-  
-  llsm_output* out = llsm_synthesize(opt_s, chunk_new);
-
-  if (!out || !out->y) {
-      printf("Failed to synthesize output: %d\n", out);
+  apply_remaining_effects(chunk_new, data, &flags);
+  apply_stabilization(chunk_new, data, &flags);
+  ms2_profile("phone.pitch_effects", stage_started, data->input);
+  stage_started = ms2_profile_time();
+  // Phrase mode hands L1 frames directly to the stitcher. Only explicit peak
+  // normalization needs temporary PCM to measure the per-phone peak, and that
+  // PCM stays in memory. Standalone resampling still produces its usual files.
+  int synthesize_phone = !phrase_chunk || flags.P > 0;
+  llsm_chunk* cache_chunk = synthesize_phone ? llsm_copy_chunk(chunk_new) : chunk_new;
+  llsm_output* out = NULL;
+  float alias_gain_db = 0;
+  if (synthesize_phone) {
+    llsm_chunk_tolayer0(chunk_new);
+    llsm_chunk_phasepropagate(chunk_new, 1);
+    printf("Synthesis\n");
+    out = llsm_synthesize(opt_s, chunk_new);
+    if (!out || !out->y) {
+      printf("Failed to synthesize output\n");
       if (cache_chunk) llsm_delete_chunk(cache_chunk);
+      if (out) llsm_delete_output(out);
+      llsm_delete_chunk(chunk_new);
+      llsm_delete_chunk(chunk);
+      llsm_delete_aoptions(opt_a);
+      llsm_delete_soptions(opt_s);
+      free(f0_curve);
       return 1;
+    }
+    alias_gain_db = normalize_waveform(out->y, out->ny, 0.50f, flags.P);
   }
 
-  float alias_gain_db = normalize_waveform(out->y, out->ny, 0.50f, flags.P);
-
+  ms2_profile(synthesize_phone ? "phone.pcm_synthesis" : "phone.pcm_skipped", stage_started, data->input);
   if (phrase_chunk) {
     float volume = data->volume > 0 ? data->volume / 100.0f : 0.0001f;
     *phrase_chunk = cache_chunk;
     if (phrase_gain_db) *phrase_gain_db = alias_gain_db + 20.0f * log10f(volume);
     if (phrase_fs) *phrase_fs = fs;
     if (phrase_nbit) *phrase_nbit = nbit;
-    llsm_delete_output(out);
+    if (out) llsm_delete_output(out);
     llsm_delete_chunk(chunk);
-    llsm_delete_chunk(chunk_new);
+    if (chunk_new != cache_chunk) llsm_delete_chunk(chunk_new);
     llsm_delete_aoptions(opt_a);
     llsm_delete_soptions(opt_s);
     free(f0_curve);
+    ms2_profile("phone.total", profile_started, data->input);
     return 0;
   }
 
@@ -775,28 +917,53 @@ int ms2_resample(const ms2_resampler_request* data) {
 }
 
 int ms2_analyze_v1(const char* input, const char* output) {
+  return ms2_analyze_config_v1(input, output, NULL);
+}
+
+int ms2_analyze_config_v1(const char* input, const char* output,
+    const ms2_analysis_settings* settings) {
+  return ms2_generate_v1(input, output, settings, 0);
+}
+
+int ms2_generate_v1(const char* input, const char* output,
+    const ms2_analysis_settings* settings, int overwrite) {
   if (!input || !input[0] || !output || !output[0]) return 1;
+  struct stat cache_stat;
+  if (!overwrite && stat(output, &cache_stat) == 0) {
+    if (ms2_validate_analysis_v1(output) == 0) return 0;
+    fprintf(stderr, "WARNING: Unusable analysis; regenerating %s\n", output);
+    ms2_profile("analysis.regenerate_invalid", ms2_profile_time(), output);
+  }
+  if (settings && (!isfinite(settings->f0_min) || !isfinite(settings->f0_max) ||
+      !isfinite(settings->voicing_bias) || settings->f0_min < 20 || settings->f0_max > 2000 ||
+      settings->f0_min >= settings->f0_max || settings->voicing_bias < .1f ||
+      settings->voicing_bias > 10 || settings->transition_range < 1 ||
+      settings->transition_range > 48 || (settings->refine_f0 != 0 && settings->refine_f0 != 1))) return 4;
   llsm_aoptions* options = llsm_create_aoptions();
   int frames = 0, fs = 0, bits = 0, samples = 0, hop = 128;
-  llsm_chunk* chunk = get_chunk_from_file(input, &frames, &fs, &bits,
-    &samples, &hop, 1, 1, options);
+  llsm_chunk* chunk = get_chunk_config(input, &frames, &fs, &bits,
+    &samples, &hop, 1, 1, options, settings);
+  if (chunk && ms2_prepare_layer1(chunk)) { llsm_delete_chunk(chunk); chunk = NULL; }
   if (!chunk) {
     llsm_delete_aoptions(options);
     return 2;
   }
-  int code = save_llsm(chunk, output, options, &fs, &bits, 0.0f) == 0 ? 0 : 3;
+  int code = ms2_save_analysis(chunk, output, options, &fs, &bits) == 0 ? 0 : 3;
   llsm_delete_chunk(chunk);
   llsm_delete_aoptions(options);
   return code;
 }
 
 int ms2_validate_analysis_v1(const char* analysis) {
+  double started = ms2_profile_time();
   if (!analysis || !analysis[0]) return 1;
   int frames = 0, fs = 0, bits = 0;
   llsm_chunk* chunk = read_llsm(analysis, &frames, &fs, &bits, NULL);
+  ms2_profile(chunk ? "analysis.validate_loaded" : "analysis.validate_failed", started, analysis);
   if (!chunk) return 2;
+  int valid = frames > 0 && fs > 0 && ms2_chunk_is_layer1(chunk);
   llsm_delete_chunk(chunk);
-  return frames > 0 && fs > 0 ? 0 : 3;
+  return valid ? 0 : 3;
 }
 
 int ms2_render_phrase_v1(const ms2_phrase_request* request, ms2_render_result* result) {
@@ -805,6 +972,8 @@ int ms2_render_phrase_v1(const ms2_phrase_request* request, ms2_render_result* r
   result->samples = NULL;
   result->sample_count = 0;
   result->sample_rate = 0;
+  double profile_started = ms2_profile_time();
+  ms2_profile("phrase.begin", profile_started, request->output);
   wavtool_phrase* phrase = wavtool_phrase_create();
   if (!phrase) return 1;
 
@@ -838,22 +1007,26 @@ int ms2_render_phrase_v1(const ms2_phrase_request* request, ms2_render_result* r
     data.ovr = phone->overlap_ms;
     data.position = phone->position_ms;
     data.use_position = 1;
+    double stitch_started = ms2_profile_time();
     if (wavtool_phrase_add(phrase, phone_chunk, fs, nbit, gain_db, &data) != 0) {
       llsm_delete_chunk(phone_chunk);
       wavtool_phrase_delete(phrase);
       return 4;
     }
+    ms2_profile("phrase.stitch_phone", stitch_started, request->output);
     llsm_delete_chunk(phone_chunk);
   }
 
   int rendered_count = 0;
   float* rendered = NULL;
+  double synth_started = ms2_profile_time();
   if (wavtool_phrase_synthesize(phrase, &rendered, &rendered_count,
       &result->sample_rate) != 0) {
     wavtool_phrase_delete(phrase);
     return 5;
   }
   wavtool_phrase_delete(phrase);
+  ms2_profile("phrase.final_synthesis", synth_started, request->output);
   int target_count = (int)ceil(request->duration_ms * result->sample_rate / 1000.0f);
   if (target_count <= 0) {
     free(rendered);
@@ -868,8 +1041,11 @@ int ms2_render_phrase_v1(const ms2_phrase_request* request, ms2_render_result* r
     sizeof(float) * (size_t)min(rendered_count, target_count));
   free(rendered);
   result->sample_count = target_count;
+  double write_started = ms2_profile_time();
   wavwrite(result->samples, result->sample_count, result->sample_rate, 16,
     (char*)request->output);
+  ms2_profile("phrase.write_wav", write_started, request->output);
+  ms2_profile("phrase.total", profile_started, request->output);
   return 0;
 }
 

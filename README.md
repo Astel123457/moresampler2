@@ -18,8 +18,7 @@ moresampler2 currently can't
 1. auto oto
 2. do anything with flags
 3. wavtool
-4. consonant velocity doesn't do anything
-5. no moreconfig.txt to change options on
-6. basically anything that sets moresampler apart from the rest (other than using moresamplers second verion of it's engine)
+4. no moreconfig.txt to change options on
+5. basically anything that sets moresampler apart from the rest (other than using moresamplers second verion of it's engine)
 
 i understand if you want certain things now, however. i'm only a guy, and unless you can code it faster than me, you'll just have to wait a little while in-between updates

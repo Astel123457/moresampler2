@@ -16,6 +16,11 @@ extern "C" {
 #endif
 
 typedef struct {
+    float f0_min, f0_max, voicing_bias;
+    int transition_range, refine_f0;
+} ms2_analysis_settings;
+
+typedef struct {
     const char* input;
     const char* output;
     float tone;
@@ -33,7 +38,21 @@ typedef struct {
     int pitch_value_count;
     const float* gender_curve;
     const float* tension_curve;
+    const float* breathiness_curve;
+    const float* voicing_curve;
+    const float* mouth_curve;
+    const float* formant_curve;
+    const float* singer_formant_curve;
+    const float* growl_curve;
+    const float* growl_coarseness_curve;
+    const float* distortion_curve;
+    const float* pitch_randomness_curve;
+    const float* unvoiced_emphasis_curve;
+    const float* amplitude_modulation_curve;
+    const float* stability_curve;
+    const float* dryness_curve;
     int expression_count;
+    const char* analysis_file; // Optional settings-specific source analysis path.
 } ms2_resampler_request;
 
 typedef struct {
@@ -71,12 +90,19 @@ MS2_API int ms2_render_phrase_v1(
 
 /* Generates or replaces reusable analysis for one source audio file. */
 MS2_API int ms2_analyze_v1(const char* input, const char* output);
+MS2_API int ms2_analyze_config_v1(const char* input, const char* output,
+    const ms2_analysis_settings* settings);
+MS2_API int ms2_generate_v1(const char* input, const char* output,
+    const ms2_analysis_settings* settings, int overwrite);
 
 /* Validates that an analysis file can be read by this engine version. */
 MS2_API int ms2_validate_analysis_v1(const char* analysis);
 
 /* Frees engine-owned memory returned by future API additions. */
 MS2_API void ms2_free(void* pointer);
+
+// Optional diagnostics; set once before starting worker calls.
+MS2_API void ms2_set_profile_path_v1(const char* path);
 
 #ifdef __cplusplus
 }

@@ -8,6 +8,47 @@
 #include <math.h>
 #include <ctype.h>
 #include "utils.h"
+#include "moresampler2.h"
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#else
+#include <time.h>
+#include <unistd.h>
+#endif
+
+static char ms2_profile_path[4096];
+
+// Configure once, before rendering/validation starts. Never changes audio or caches.
+void ms2_set_profile_path_v1(const char* path) {
+  if (!ms2_profile_path[0] && path && strlen(path) < sizeof(ms2_profile_path))
+    strcpy(ms2_profile_path, path);
+}
+
+double ms2_profile_time(void) {
+#ifdef _WIN32
+  LARGE_INTEGER now, frequency;
+  QueryPerformanceCounter(&now);
+  QueryPerformanceFrequency(&frequency);
+  return (double)now.QuadPart / frequency.QuadPart;
+#else
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return now.tv_sec + now.tv_nsec * 1e-9;
+#endif
+}
+
+void ms2_profile(const char* stage, double started, const char* detail) {
+  if (!ms2_profile_path[0]) return;
+  double now = ms2_profile_time();
+  FILE* file = fopen(ms2_profile_path, "a");
+  if (!file) return; // Profiling must never make rendering fail.
+  fprintf(file, "native t=%.6f stage=%s elapsed_ms=%.3f detail=%s\n",
+    now, stage, (now - started) * 1000, detail ? detail : "");
+  fclose(file);
+}
 
 #define MS2_CACHE_VERSION_RAW 2
 #define MS2_CACHE_VERSION_L1_HYBRID 3
@@ -229,6 +270,7 @@ int read_conf(FILE* f, llsm_aoptions* opt) {
     fread(&opt->nchannel, sizeof(int), 1, f);
     int chanfreq_len;
     fread(&chanfreq_len, sizeof(int), 1, f);
+    free(opt->chanfreq);
     opt->chanfreq = malloc(sizeof(FP_TYPE) * chanfreq_len);
     if (!opt->chanfreq) return -1;
     fread(opt->chanfreq, sizeof(FP_TYPE), chanfreq_len, f);
@@ -336,11 +378,13 @@ int save_llsm(llsm_chunk* chunk, const char* filename, llsm_aoptions* conf, int*
     }
   }
 
-  fclose(f);
-  return 0;
+  int failed = ferror(f);
+  if (fclose(f) != 0) failed = 1;
+  return failed ? -1 : 0;
 }
 
-llsm_chunk* read_llsm(const char* filename, int* nfrm, int* fs, int* nbit, float* alias_gain_db) {
+llsm_chunk* read_llsm_options(const char* filename, int* nfrm, int* fs, int* nbit,
+    float* alias_gain_db, llsm_aoptions* options) {
   FILE* f = fopen(filename, "rb");
   if (!f) return NULL;
 
@@ -373,17 +417,17 @@ llsm_chunk* read_llsm(const char* filename, int* nfrm, int* fs, int* nbit, float
   fread(fs, sizeof(int), 1, f);
   fread(nbit, sizeof(int), 1, f);
 
-  llsm_aoptions* aopt = llsm_create_aoptions();
+  llsm_aoptions* aopt = options ? options : llsm_create_aoptions();
   if (read_conf(f, aopt) != 0) {
-    llsm_delete_aoptions(aopt);
+    if (!options) llsm_delete_aoptions(aopt);
     fclose(f);
     return NULL;
   }
 
-  llsm_container* conf = llsm_aoptions_toconf(aopt, 44100.0 / 2);
+  llsm_container* conf = llsm_aoptions_toconf(aopt, *fs / 2.0);
   int conf_npsd = aopt->npsd;
   int conf_nchannel = aopt->nchannel;
-  llsm_delete_aoptions(aopt);
+  if (!options) llsm_delete_aoptions(aopt);
   llsm_container_attach(conf, LLSM_CONF_NFRM,
     llsm_create_int(*nfrm), llsm_delete_int, llsm_copy_int);
   if (layer == 1 && nspec > 0) {
@@ -398,11 +442,15 @@ llsm_chunk* read_llsm(const char* filename, int* nfrm, int* fs, int* nbit, float
     fread(&npsd_coeffs, sizeof(int), 1, f);
   }
 
-  llsm_chunk* chunk = llsm_create_chunk(conf, *nfrm);
+  // Frames are decoded below; the second argument is an initialization flag.
+  llsm_chunk* chunk = llsm_create_chunk(conf, 0);
   llsm_delete_container(conf);
+  if (!chunk) { fclose(f); return NULL; }
 
   for (int i = 0; i < *nfrm; ++i) {
     llsm_container* frame = llsm_create_frame(0, 0, 0, 0);
+    // Own the frame immediately so decode-error cleanup also releases it.
+    chunk->frames[i] = frame;
     FP_TYPE* f0 = malloc(sizeof(FP_TYPE));
     fread(f0, sizeof(FP_TYPE), 1, f);
     llsm_container_attach(frame, LLSM_FRAME_F0, f0, free, llsm_copy_fp);
@@ -484,11 +532,64 @@ llsm_chunk* read_llsm(const char* filename, int* nfrm, int* fs, int* nbit, float
       nm->eenv[j] = eenv;
     }
     llsm_container_attach(frame, LLSM_FRAME_NM, nm, llsm_delete_nmframe, llsm_copy_nmframe);
-    chunk->frames[i] = frame;
   }
 
   fclose(f);
   return chunk;
+}
+
+llsm_chunk* read_llsm(const char* filename, int* nfrm, int* fs, int* nbit, float* gain) {
+  return read_llsm_options(filename, nfrm, fs, nbit, gain, NULL);
+}
+
+int ms2_chunk_is_layer1(llsm_chunk* chunk) {
+  if (!chunk) return 0;
+  int* nspec = llsm_container_get(chunk->conf, LLSM_CONF_NSPEC);
+  if (!nspec || *nspec <= 0) return 0;
+  int* count = llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
+  if (!count || *count <= 0) return 0;
+  for (int i = 0; i < *count; ++i)
+    if (!chunk->frames[i] || !llsm_frame_checklayer1(chunk->frames[i])) return 0;
+  return 1;
+}
+
+int ms2_prepare_layer1(llsm_chunk* chunk) {
+  if (ms2_chunk_is_layer1(chunk)) return 0;
+  double started = ms2_profile_time();
+  llsm_chunk_tolayer1(chunk, 2048);
+  ms2_profile("analysis.convert_layer1", started, NULL);
+  return ms2_chunk_is_layer1(chunk) ? 0 : 1;
+}
+
+// Replace only after a complete write, preserving the old cache on failure.
+int ms2_save_analysis(llsm_chunk* chunk, const char* filename, llsm_aoptions* options,
+    int* fs, int* bits) {
+  char* temporary = malloc(strlen(filename) + 8);
+  if (!temporary) return -1;
+  sprintf(temporary, "%s.XXXXXX", filename);
+#ifdef _WIN32
+  int fd = _mktemp_s(temporary, strlen(temporary) + 1) == 0
+    ? _open(temporary, _O_CREAT | _O_EXCL | _O_WRONLY | _O_BINARY, _S_IREAD | _S_IWRITE) : -1;
+#else
+  int fd = mkstemp(temporary);
+#endif
+  if (fd < 0) { free(temporary); return -1; }
+#ifdef _WIN32
+  _close(fd);
+#else
+  close(fd);
+#endif
+  int result = save_llsm(chunk, temporary, options, fs, bits, 0);
+  if (!result) {
+#ifdef _WIN32
+    result = MoveFileExA(temporary, filename, MOVEFILE_REPLACE_EXISTING) ? 0 : -1;
+#else
+    result = rename(temporary, filename);
+#endif
+  }
+  if (result) remove(temporary);
+  free(temporary);
+  return result;
 }
 
 char* build_llsm_path(const char* filename) {
@@ -504,7 +605,15 @@ char* build_llsm_path(const char* filename) {
 
 llsm_chunk* get_chunk_from_file(const char* filename, int* nfrm, int* fs, int* nbit,
     int* nx, int* nhop, int nosave, int force_analysis, llsm_aoptions* opt_a) {
+    return get_chunk_config(filename, nfrm, fs, nbit, nx, nhop, nosave,
+        force_analysis, opt_a, NULL);
+}
 
+llsm_chunk* get_chunk_config(const char* filename, int* nfrm, int* fs, int* nbit,
+    int* nx, int* nhop, int nosave, int force_analysis, llsm_aoptions* opt_a,
+    const ms2_analysis_settings* settings) {
+
+    double profile_started = ms2_profile_time();
     llsm_chunk* chunk = NULL;
     FP_TYPE* f0 = NULL;
     FP_TYPE* input = NULL;
@@ -514,13 +623,20 @@ llsm_chunk* get_chunk_from_file(const char* filename, int* nfrm, int* fs, int* n
     if (!llsm_path) {
       printf("WARNING: Failed to build LLSM2 filename path. Analysis will proceed without caching.\n");
     }
-    FILE* llsm_file = fopen(llsm_path, "rb");
+    FILE* llsm_file = llsm_path ? fopen(llsm_path, "rb") : NULL;
 
     if (llsm_file && !force_analysis) {
       // File exists — use cached analysis
       fclose(llsm_file);
       printf("Loading cached LLSM analysis: %s\n", llsm_path);
-      chunk = read_llsm(llsm_path, nfrm, fs, nbit, NULL);
+      chunk = read_llsm_options(llsm_path, nfrm, fs, nbit, NULL, opt_a);
+      ms2_profile(chunk ? "analysis.cache_hit" : "analysis.cache_invalid", profile_started, llsm_path);
+      if (chunk && !ms2_chunk_is_layer1(chunk)) {
+        if (ms2_prepare_layer1(chunk)) {
+          llsm_delete_chunk(chunk);
+          chunk = NULL;
+        }
+      }
       free(llsm_path);
       if (!chunk) {
         printf("Failed to read .llsm2 file\n");
@@ -529,6 +645,7 @@ llsm_chunk* get_chunk_from_file(const char* filename, int* nfrm, int* fs, int* n
     } else {
       if (llsm_file) fclose(llsm_file);
       // No cache — analyze audio
+      ms2_profile(force_analysis ? "analysis.forced_begin" : "analysis.missing_begin", profile_started, filename);
       printf("Reading input WAV: %s\n", filename);
       input = wavread((char*)filename, fs, nbit, nx);
       if (!input) { free(llsm_path); return NULL; }
@@ -544,25 +661,26 @@ llsm_chunk* get_chunk_from_file(const char* filename, int* nfrm, int* fs, int* n
       }
       normalize_waveform(input_temp, *nx, 0.99f, 100);
       pyin_config param = pyin_init(*nhop);
-      param.fmin = 50.0f;
-      param.fmax = 800.0f;
-      param.trange = 24;
-      param.bias = 2;
+      param.fmin = settings ? settings->f0_min : 50.0f;
+      param.fmax = settings ? settings->f0_max : 800.0f;
+      param.trange = settings ? settings->transition_range : 24;
+      param.bias = settings ? settings->voicing_bias : 2;
       param.nf = ceil(*fs * 0.025);
       f0 = pyin_analyze(param, input_temp, *nx, *fs, nfrm);
       if (!f0) { free(input); free(input_temp); free(llsm_path); return NULL; }
     
       opt_a->thop = (FP_TYPE)(*nhop) / (*fs);
-      opt_a->f0_refine = 1;
+      opt_a->f0_refine = settings ? settings->refine_f0 : 1;
       opt_a->hm_method = LLSM_AOPTION_HMCZT;
     
       printf("Analysis\n");
       chunk = llsm_analyze(opt_a, input, *nx, *fs, f0, *nfrm, NULL);
+      if (chunk && ms2_prepare_layer1(chunk)) { llsm_delete_chunk(chunk); chunk = NULL; }
       if (!chunk) { free(input); free(f0); free(input_temp); free(llsm_path); return NULL; }
       if(llsm_path != NULL) {
         printf("Saving analysis result to cache: %s\n", llsm_path);
           if (!nosave) {
-            if (save_llsm(chunk, llsm_path, opt_a, fs, nbit, 0.0f) != 0) {
+            if (ms2_save_analysis(chunk, llsm_path, opt_a, fs, nbit) != 0) {
               printf("Failed to save .llsm2 file.\n");
             }
           }
@@ -572,5 +690,6 @@ llsm_chunk* get_chunk_from_file(const char* filename, int* nfrm, int* fs, int* n
       free(input);
       free(f0);
     }
+    ms2_profile("analysis.load_or_generate_total", profile_started, filename);
     return chunk;
 }
