@@ -32,9 +32,9 @@ public sealed class Moresampler2RendererPlugin : IOpenUtauRendererPlugin {
             ["MOPN"] = Curve("Mouth opening", "MOPN"),
             ["MFRM"] = Curve("Formant emphasis", "MFRM"),
             ["MSFM"] = Curve("Singer formant", "MSFM"),
-            ["MGRW"] = Curve("Growl", "MGRW"),
-            ["MCRS"] = Curve("Growl coarseness", "MCRS"),
-            ["MDST"] = Curve("Distortion", "MDST"),
+            ["MGRW"] = new("Growl", "MGRW", 0, 100, 0) { type = UExpressionType.Curve },
+            ["MCRS"] = new("Coarseness", "MCRS", 0, 100, 0) { type = UExpressionType.Curve },
+            ["MDST"] = new("Distortion", "MDST", 0, 100, 0) { type = UExpressionType.Curve },
             ["MPRN"] = Curve("Pitch randomness", "MPRN"),
             ["MUVC"] = Curve("Unvoiced emphasis", "MUVC"),
             ["MAMP"] = Curve("Pitch-linked amplitude", "MAMP"),
@@ -268,7 +268,7 @@ sealed class Moresampler2Engine : IResampler {
         using var timing = RendererProfile.Measure("phrase", $"hash={phrase.hash:x16} phones={items.Length}");
         // Stable across renders and rebuilds. This revision excludes pre-fix audio;
         // the host phrase hash distinguishes note/curve/setting changes.
-        var outputPath = cache.GetPhrasePath(phrase, ".neutral1.wav");
+        var outputPath = cache.GetPhrasePath(phrase, ".pulse2-tension2.wav");
         if (!phrase.phones.Any(phone => phone.direct) && File.Exists(outputPath)) {
             RendererProfile.Write("phrase.cache_hit", outputPath);
             using var stream = Wave.OpenFile(outputPath);

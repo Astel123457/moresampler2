@@ -240,7 +240,9 @@ static void apply_tension_frame(llsm_container* frame, FP_TYPE tension) {
 
     FP_TYPE* rd = (FP_TYPE*)llsm_container_get(frame, LLSM_FRAME_RD);
     if (rd && *rd > 0) {
-        FP_TYPE shaped = *rd * (FP_TYPE)pow(2.0, (double)-t);
+        // Two octaves of source-shape scaling at full tension, rather than
+        // one. Keep the existing Rd limits and spectral tilt unchanged.
+        FP_TYPE shaped = *rd * (FP_TYPE)pow(2.0, (double)(-2 * t));
         if (shaped < (FP_TYPE)0.3) shaped = (FP_TYPE)0.3;
         if (shaped > (FP_TYPE)3.0) shaped = (FP_TYPE)3.0;
         *rd = shaped;
@@ -407,6 +409,39 @@ static void warp_spectrum(FP_TYPE* spectrum, int count, FP_TYPE amount) {
   free(source);
 }
 
+// MC is harmonic-shaped noise coloration, not MG speed. Adapt the original
+// 00413cd0 weighting knots to libllsm2's linear-frequency, dB noise PSD.
+static void apply_coarseness(llsm_chunk* chunk, llsm_container* frame, FP_TYPE amount) {
+  if (amount <= 0) return;
+  FP_TYPE* f0 = llsm_container_get(frame, LLSM_FRAME_F0);
+  llsm_nmframe* nm = llsm_container_get(frame, LLSM_FRAME_NM);
+  if (!f0 || *f0 <= 0 || !nm || nm->npsd < 2) return;
+  llsm_frame_tolayer0(frame, chunk->conf);
+  llsm_hmframe* hm = llsm_container_get(frame, LLSM_FRAME_HM);
+  if (!hm || hm->nhar < 1) return;
+  FP_TYPE nyquist = *(FP_TYPE*)llsm_container_get(chunk->conf, LLSM_CONF_FNYQ);
+  const FP_TYPE knots[] = {0, 400, 1000, 2000, 4000, 8000, 192000};
+  const FP_TYPE log_weight[] = {-5, -2.5, -.5, 0, 0, 0, 0};
+  FP_TYPE strength = clamp_fp(amount, 0, 100) / 100;
+  for (int i = 0; i < nm->npsd; ++i) {
+    FP_TYPE hz = nyquist * i / (nm->npsd - 1);
+    if (hz > hm->nhar * *f0) continue;
+    int band = 0;
+    while (band < 5 && hz > knots[band + 1]) ++band;
+    FP_TYPE t = (hz - knots[band]) / (knots[band + 1] - knots[band]);
+    FP_TYPE weight = (FP_TYPE)exp(log_weight[band] * (1 - t) + log_weight[band + 1] * t);
+    FP_TYPE h = clamp_fp(hz / *f0 - 1, 0, hm->nhar - 1);
+    int a = (int)h, b = min(a + 1, hm->nhar - 1);
+    FP_TYPE amplitude = hm->ampl[a] * (1 - h + a) + hm->ampl[b] * (h - a);
+    // Spread each harmonic's power over its F0-wide interval (PSD units).
+    FP_TYPE floor_db = 10 * (FP_TYPE)log10(max((FP_TYPE)1e-12,
+      amplitude * amplitude * .5f / *f0 * weight * strength * .5f));
+    if (hz < 400) nm->psd[i] -= .05f * amount * (FP_TYPE)(10 / log(10.0));
+    nm->psd[i] = max(nm->psd[i], floor_db);
+  }
+  llsm_container_remove(frame, LLSM_FRAME_HM);
+}
+
 static void apply_remaining_effects(llsm_chunk* chunk, const ms2_resampler_request* data,
     const Flags* flags) {
   if (!chunk || !remaining_effects_active(data, flags)) return;
@@ -440,6 +475,10 @@ static void apply_remaining_effects(llsm_chunk* chunk, const ms2_resampler_reque
       frame_index, count, flags->MC);
     FP_TYPE distortion = effect_value(data->distortion_curve, data->expression_count,
       frame_index, count, flags->MD);
+    if (growl > 0) llsm_container_attach(frame, MS2_FRAME_GROWL,
+      llsm_create_fp(clamp_fp(growl, 0, 100)), llsm_delete_fp, llsm_copy_fp);
+    if (distortion > 0) llsm_container_attach(frame, MS2_FRAME_DISTORTION,
+      llsm_create_fp(clamp_fp(distortion, 0, 100)), llsm_delete_fp, llsm_copy_fp);
     FP_TYPE randomness = effect_value(data->pitch_randomness_curve, data->expression_count,
       frame_index, count, flags->Mp);
     FP_TYPE unvoiced_emphasis = effect_value(data->unvoiced_emphasis_curve,
@@ -483,19 +522,12 @@ static void apply_remaining_effects(llsm_chunk* chunk, const ms2_resampler_reque
     }
     if (vt) {
       FP_TYPE voiced_gain = -breath * (FP_TYPE)0.06;
-      voiced_gain -= max(max(breath, 0), coarse) * (FP_TYPE)0.04;
-      FP_TYPE rate = (FP_TYPE)(2.0 + coarse * 0.08);
-      FP_TYPE growl_gain = growl * (FP_TYPE)0.08 *
-        (FP_TYPE)sin(2.0 * M_PI * rate * frame_index / max(1, count));
+      voiced_gain -= max(breath, 0) * (FP_TYPE)0.04;
       for (int i = 0; i < vt_count; ++i) {
-        FP_TYPE normalized = vt_count > 1 ? (FP_TYPE)i / (vt_count - 1) : 0;
-        vt[i] += voiced_gain + growl_gain + amplitude_gain;
-        vt[i] += coarse * (FP_TYPE)0.035 *
-          (FP_TYPE)sin(2.0 * M_PI * (3.0 + coarse * 0.06) * normalized);
-        vt[i] += distortion * (FP_TYPE)0.04 *
-          (FP_TYPE)sin(2.0 * M_PI * (8.0 + normalized * 24.0) * frame_index / max(1, count));
+        vt[i] += voiced_gain + amplitude_gain;
       }
     }
+    apply_coarseness(chunk, frame, coarse);
     if (f0 && *f0 > 0 && randomness > 0) {
       unsigned hash = (unsigned)(frame_index + 1) * 1103515245u + 12345u;
       FP_TYPE noise = ((hash >> 8) & 0xffff) / (FP_TYPE)32767.5 - 1;
@@ -856,7 +888,7 @@ static int ms2_process(const ms2_resampler_request* data,
     llsm_chunk_phasepropagate(chunk_new, 1);
     printf("Synthesis\n");
     out = llsm_synthesize(opt_s, chunk_new);
-    if (!out || !out->y) {
+    if (!out || !out->y || ms2_pulse_effects(chunk_new, out)) {
       printf("Failed to synthesize output\n");
       if (cache_chunk) llsm_delete_chunk(cache_chunk);
       if (out) llsm_delete_output(out);

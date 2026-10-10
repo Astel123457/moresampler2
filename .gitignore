@@ -37,5 +37,6 @@ build/
 *.cmake
 CMakeFiles/
 moresampler_decomp/
-tests/
+tests/*
+!tests/growl.c
 *.ini

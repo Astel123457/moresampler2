@@ -21,6 +21,91 @@
 
 static char ms2_profile_path[4096];
 
+static FP_TYPE pulse_random(uint32_t* state) {
+  *state = *state * 1664525u + 1013904223u;
+  return (*state >> 8) / (FP_TYPE)16777215;
+}
+
+// Adapted from the raw 0040e900/00418b30 trace: pitch-synchronous Hann
+// windows, six-pulse MG pattern, alternating MD gain, split at 1500 Hz.
+// libllsm2 supplies F0 rather than the original LMIX pulse-position list.
+int ms2_pulse_effects(llsm_chunk* chunk, llsm_output* output) {
+  if (!chunk || !output || !output->y || output->ny < 2) return 0;
+  int* count_ptr = llsm_container_get(chunk->conf, LLSM_CONF_NFRM);
+  FP_TYPE* hop_ptr = llsm_container_get(chunk->conf, LLSM_CONF_THOP);
+  if (!count_ptr || *count_ptr <= 0 || !hop_ptr || !isfinite(*hop_ptr) || *hop_ptr <= 0
+      || !isfinite(output->fs) || output->fs <= 0) return 1;
+  int count = *count_ptr;
+  FP_TYPE hop = *hop_ptr;
+  int active = 0;
+  for (int i = 0; i < count; ++i) {
+    FP_TYPE* g = llsm_container_get(chunk->frames[i], MS2_FRAME_GROWL);
+    FP_TYPE* d = llsm_container_get(chunk->frames[i], MS2_FRAME_DISTORTION);
+    active |= (g && *g > 0) || (d && *d > 0);
+  }
+  if (!active) return 0; // Neutral synthesis remains bit-for-bit untouched.
+  int n = output->ny;
+  FP_TYPE* low = calloc((size_t)n, sizeof(FP_TYPE));
+  FP_TYPE* result = calloc((size_t)n, sizeof(FP_TYPE));
+  FP_TYPE* weights = calloc((size_t)n, sizeof(FP_TYPE));
+  if (!low || !result || !weights) {
+    free(low); free(result); free(weights); return 1;
+  }
+  FP_TYPE taps[32], sum = 0;
+  for (int k = 0; k < 32; ++k) {
+    double x = k - 15.5, fc = 1500.0 / output->fs;
+    taps[k] = (FP_TYPE)(sin(2 * M_PI * fc * x) / (M_PI * x)
+      * (0.5 - 0.5 * cos(2 * M_PI * k / 31)));
+    sum += taps[k];
+  }
+  for (int i = 0; i < n; ++i)
+    for (int k = 0; k < 32; ++k) {
+      // Half-sample compensated, centered FIR. High = original - low.
+      int j = i + k - 16;
+      FP_TYPE a = j >= 0 && j < n ? output->y[j] : 0;
+      FP_TYPE b = j + 1 >= 0 && j + 1 < n ? output->y[j + 1] : 0;
+      low[i] += (a + b) * (FP_TYPE)0.5 * taps[k] / sum;
+    }
+  const FP_TYPE pattern[6] = {-.89830506f, -.69491524f, -.1864407f,
+    .62711865f, .8305084f, .32203388f};
+  uint32_t random = 1;
+  double phase = 0;
+  unsigned pulse = 0;
+  for (int center = 0; center < n; ++center) {
+    int frame = min(count - 1, (int)(center / (output->fs * hop)));
+    FP_TYPE* f0 = llsm_container_get(chunk->frames[frame], LLSM_FRAME_F0);
+    if (!f0 || !isfinite(*f0) || *f0 <= 0) { phase = 0; continue; }
+    phase += *f0 / output->fs;
+    if (phase < 1) continue;
+    phase -= floor(phase);
+    FP_TYPE* gp = llsm_container_get(chunk->frames[frame], MS2_FRAME_GROWL);
+    FP_TYPE* dp = llsm_container_get(chunk->frames[frame], MS2_FRAME_DISTORTION);
+    FP_TYPE g = gp ? *gp / 100 : 0, d = dp ? *dp / 100 : 0;
+    int radius = max(1, (int)round(min(n, output->fs / *f0)));
+    for (int band = 0; band < 2; ++band) {
+      FP_TYPE strength = band ? .5f : .1f;
+      int shift = band ? (int)round(.03 * g * radius *
+        (cos(pulse * M_PI / 3) - .5 + pulse_random(&random))) : 0;
+      FP_TYPE gain = 1 + 1.5f * g * ((pulse_random(&random) - .5f) * .3f
+        + strength * pattern[pulse % 6]);
+      gain += strength * 1.5f * d * ((pulse & 1 ? -1.5f : .5f) + pulse_random(&random));
+      for (int j = -radius; j < radius; ++j) {
+        int src = center + j, dst = src + shift;
+        if (src < 0 || src >= n) continue;
+        FP_TYPE w = (FP_TYPE)(.5 - .5 * cos(2 * M_PI * (j + radius) / (2 * radius - 1)));
+        if (!band) weights[src] += w;
+        if (dst >= 0 && dst < n)
+          result[dst] += w * gain * (band ? output->y[src] - low[src] : low[src]);
+      }
+    }
+    ++pulse;
+  }
+  for (int i = 0; i < n; ++i)
+    output->y[i] = result[i] + max(0, 1 - weights[i]) * output->y[i];
+  free(low); free(result); free(weights);
+  return 0;
+}
+
 // Configure once, before rendering/validation starts. Never changes audio or caches.
 void ms2_set_profile_path_v1(const char* path) {
   if (!ms2_profile_path[0] && path && strlen(path) < sizeof(ms2_profile_path))
@@ -51,6 +136,7 @@ void ms2_profile(const char* stage, double started, const char* detail) {
 }
 
 #define MS2_CACHE_VERSION_RAW 2
+#define MS2_CACHE_VERSION_EFFECTS 4
 #define MS2_CACHE_VERSION_L1_HYBRID 3
 #define MS2_VTMAGN_COEFFS 384
 #define MS2_NPSD_COEFFS 96
@@ -129,6 +215,7 @@ FP_TYPE ms2_linterpc(FP_TYPE a, FP_TYPE b, FP_TYPE ratio) {
 void ms2_interp_nmframe(llsm_nmframe* dst, llsm_nmframe* src, FP_TYPE ratio) {
   if (!dst || !src) return;
 
+
   int npsd = min(dst->npsd, src->npsd);
   for (int i = 0; i < npsd; ++i) {
     dst->psd[i] = ms2_lerp(dst->psd[i], src->psd[i], ratio);
@@ -166,6 +253,13 @@ void ms2_interp_llsm_frame(llsm_container* dst, llsm_container* src, FP_TYPE rat
 #define MS2_EPS ((FP_TYPE)1e-8)
 #define MS2_LOG2DB ((FP_TYPE)(20.0 / 2.3025851))
   if (!dst || !src) return;
+  for (int key = MS2_FRAME_GROWL; key <= MS2_FRAME_DISTORTION; ++key) {
+    FP_TYPE* a = llsm_container_get(dst, key);
+    FP_TYPE* b = llsm_container_get(src, key);
+    if (a || b) llsm_container_attach(dst, key,
+      llsm_create_fp((a ? *a : 0) * (1 - ratio) + (b ? *b : 0) * ratio),
+      llsm_delete_fp, llsm_copy_fp);
+  }
 
   FP_TYPE* dst_f0_p = (FP_TYPE*)llsm_container_get(dst, LLSM_FRAME_F0);
   FP_TYPE* src_f0_p = (FP_TYPE*)llsm_container_get(src, LLSM_FRAME_F0);
@@ -302,6 +396,10 @@ int save_llsm(llsm_chunk* chunk, const char* filename, llsm_aoptions* conf, int*
   // Wavtool reloads and resaves layer-1 caches across note concatenation, so
   // the on-disk cache must stay lossless on the write path.
   int version = MS2_CACHE_VERSION_RAW;
+  for (int i = 0; i < nfrm_val; ++i)
+    if (llsm_container_get(chunk->frames[i], MS2_FRAME_GROWL) ||
+        llsm_container_get(chunk->frames[i], MS2_FRAME_DISTORTION))
+      version = MS2_CACHE_VERSION_EFFECTS;
   fwrite("LLSM2", 1, 5, f);
   fwrite(&version, sizeof(int), 1, f);
   fwrite(&layer, sizeof(int), 1, f);
@@ -376,6 +474,13 @@ int save_llsm(llsm_chunk* chunk, const char* filename, llsm_aoptions* conf, int*
       fwrite(eenv->ampl, sizeof(FP_TYPE), eenv->nhar, f);
       fwrite(eenv->phse, sizeof(FP_TYPE), eenv->nhar, f);
     }
+    if (version == MS2_CACHE_VERSION_EFFECTS) {
+      for (int key = MS2_FRAME_GROWL; key <= MS2_FRAME_DISTORTION; ++key) {
+        FP_TYPE* value = llsm_container_get(frame, key);
+        FP_TYPE scalar = value ? *value : 0;
+        fwrite(&scalar, sizeof(scalar), 1, f);
+      }
+    }
   }
 
   int failed = ferror(f);
@@ -394,7 +499,8 @@ llsm_chunk* read_llsm_options(const char* filename, int* nfrm, int* fs, int* nbi
 
   int version;
   fread(&version, sizeof(int), 1, f);
-  if (version != 1 && version != MS2_CACHE_VERSION_RAW && version != MS2_CACHE_VERSION_L1_HYBRID) {
+  if (version != 1 && version != MS2_CACHE_VERSION_RAW && version != MS2_CACHE_VERSION_L1_HYBRID
+      && version != MS2_CACHE_VERSION_EFFECTS) {
     fclose(f);
     return NULL;
   }
@@ -532,6 +638,16 @@ llsm_chunk* read_llsm_options(const char* filename, int* nfrm, int* fs, int* nbi
       nm->eenv[j] = eenv;
     }
     llsm_container_attach(frame, LLSM_FRAME_NM, nm, llsm_delete_nmframe, llsm_copy_nmframe);
+    if (version == MS2_CACHE_VERSION_EFFECTS) {
+      for (int key = MS2_FRAME_GROWL; key <= MS2_FRAME_DISTORTION; ++key) {
+        FP_TYPE value;
+        if (fread(&value, sizeof(value), 1, f) != 1 || !isfinite(value) || value < 0 || value > 100) {
+          llsm_delete_chunk(chunk); fclose(f); return NULL;
+        }
+        if (value > 0) llsm_container_attach(frame, key,
+          llsm_create_fp(value), llsm_delete_fp, llsm_copy_fp);
+      }
+    }
   }
 
   fclose(f);

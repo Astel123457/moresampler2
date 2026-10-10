@@ -36,6 +36,7 @@ int main(void) {
     spectra[i] = llsm_create_fparray(4);
     memcpy(spectra[i], original, sizeof(original));
     llsm_container_attach(chunk->frames[i], LLSM_FRAME_VTMAGN, spectra[i], llsm_delete_fparray, llsm_copy_fparray);
+    llsm_container_attach(chunk->frames[i], LLSM_FRAME_RD, llsm_create_fp(1.6f), llsm_delete_fp, llsm_copy_fp);
   }
   apply_gender(chunk, 0);
   apply_gender_curve(chunk, zero, 3);
@@ -46,7 +47,30 @@ int main(void) {
   for (int i = 0; i < 3; ++i) {
     check(llsm_container_get(chunk->frames[i], LLSM_FRAME_VTMAGN) == spectra[i], "neutral effects must not replace spectra");
     check(!memcmp(spectra[i], original, sizeof(original)), "neutral effects must preserve spectra bit-for-bit");
+    check(*(FP_TYPE*)llsm_container_get(chunk->frames[i], LLSM_FRAME_RD) == 1.6f,
+      "neutral tension must preserve source shape");
   }
+  llsm_chunk* tension_curve = llsm_copy_chunk(chunk);
+  Flags tension_flags;
+  parse_flag_string("Mt100", &tension_flags);
+  apply_tension(chunk, tension_flags.Mt);
+  float full_tension[] = {100, 100, 100};
+  apply_tension_curve(tension_curve, full_tension, 3);
+  for (int i = 0; i < 3; ++i) {
+    FP_TYPE* rd = llsm_container_get(chunk->frames[i], LLSM_FRAME_RD);
+    FP_TYPE* curve_rd = llsm_container_get(tension_curve->frames[i], LLSM_FRAME_RD);
+    check(fabs(*rd - .4f) < 1e-6, "full tension must quarter Rd before clamping");
+    check(fabs(*rd - *curve_rd) < 1e-6, "Mt and TENC must use the same scaling");
+    check(fabs(spectra[i][0] - (original[0] - 6)) < 1e-5 &&
+      fabs(spectra[i][3] - (original[3] + 6)) < 1e-5, "tension spectral tilt changed");
+    *rd = .4f;
+    apply_tension_frame(chunk->frames[i], 100);
+    check(*rd == .3f, "positive tension must retain lower Rd limit");
+    *rd = 1.6f;
+    apply_tension_frame(chunk->frames[i], -100);
+    check(*rd == 3.0f, "negative tension must retain upper Rd limit");
+  }
+  llsm_delete_chunk(tension_curve);
   FP_TYPE waveform[] = {-.123f, .234f, -.345f};
   FP_TYPE before[3]; memcpy(before, waveform, sizeof(before));
   check(normalize_waveform(waveform, 3, .5f, flags.P) == 0, "default normalization gain must be zero");

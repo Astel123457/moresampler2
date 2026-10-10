@@ -9,7 +9,7 @@ expressions:
   mfrm: { name: Formant emphasis, abbr: mfrm, type: Numerical, min: -100, max: 100, default_value: 0, is_flag: true, flag: ME }
   msfm: { name: Singer formant, abbr: msfm, type: Numerical, min: -100, max: 100, default_value: 0, is_flag: true, flag: Mr }
   mgrw: { name: Growl, abbr: mgrw, type: Numerical, min: 0, max: 100, default_value: 0, is_flag: true, flag: MG }
-  mcrs: { name: Growl coarseness, abbr: mcrs, type: Numerical, min: 0, max: 100, default_value: 0, is_flag: true, flag: MC }
+  mcrs: { name: Coarseness, abbr: mcrs, type: Numerical, min: 0, max: 100, default_value: 0, is_flag: true, flag: MC }
   mdst: { name: Distortion, abbr: mdst, type: Numerical, min: 0, max: 100, default_value: 0, is_flag: true, flag: MD }
   mprn: { name: Pitch randomness, abbr: mprn, type: Numerical, min: 0, max: 100, default_value: 0, is_flag: true, flag: Mp }
   muvc: { name: Unvoiced emphasis, abbr: muvc, type: Numerical, min: -20, max: 100, default_value: 0, is_flag: true, flag: b }

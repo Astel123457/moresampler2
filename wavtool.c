@@ -375,7 +375,8 @@ int wavtool(wavtool_data* data) {
     llsm_output* synth_out = llsm_synthesize(opt_s, combined);
     llsm_delete_soptions(opt_s);
 
-    if (!synth_out || !synth_out->y) {
+    if (!synth_out || !synth_out->y || ms2_pulse_effects(combined, synth_out)) {
+        if (synth_out) llsm_delete_output(synth_out);
         fprintf(stderr, "wavtool: synthesis failed\n");
         append_debug_log(debug_log, 0, "  synth_failed=1\n");
         llsm_delete_chunk(combined);
@@ -527,6 +528,10 @@ int wavtool_phrase_synthesize(wavtool_phrase* phrase, float** samples,
     options->use_l1 = 1;
     started = ms2_profile_time();
     llsm_output* output = llsm_synthesize(options, synthesis);
+    if (output && ms2_pulse_effects(synthesis, output)) {
+        llsm_delete_output(output);
+        output = NULL;
+    }
     ms2_profile("final.llsm_synthesize", started, NULL);
     llsm_delete_soptions(options);
     llsm_delete_chunk(synthesis);

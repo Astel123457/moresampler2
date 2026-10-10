@@ -2,6 +2,11 @@
 #include <llsm.h>
 #include "moresampler2.h"
 
+// Private scalar frame controls, copied with frames and blended at stitches.
+#define MS2_FRAME_GROWL 16
+#define MS2_FRAME_DISTORTION 17
+int ms2_pulse_effects(llsm_chunk* chunk, llsm_output* output);
+
 double ms2_profile_time(void);
 void ms2_profile(const char* stage, double started, const char* detail);
 int ms2_chunk_is_layer1(llsm_chunk* chunk);
