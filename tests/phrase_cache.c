@@ -1,5 +1,9 @@
 #include <libllsm/llsm.h>
+#ifdef _WIN32
+#include <sys/utime.h>
+#else
 #include <utime.h>
+#endif
 static int synthesis_calls;
 static llsm_output* counted_synthesis(llsm_soptions* options, llsm_chunk* chunk) {
     ++synthesis_calls;
@@ -104,8 +108,13 @@ int main(void) {
     check(ms2_generate_v1(input, variant, &configured, 1) == 4, "invalid F0 interval must fail when generating");
     configured.f0_min = 120;
     configured.refine_f0 = 1;
+#ifdef _WIN32
+    struct _utimbuf old_time = {1, 1};
+    check(_utime(variant, &old_time) == 0, "could not mark analysis older than source");
+#else
     struct utimbuf old_time = {1, 1};
     check(utime(variant, &old_time) == 0, "could not mark analysis older than source");
+#endif
     // Reuse must not touch the file, even when the source is newer and settings differ.
     FILE* source_again = fopen(input, "ab");
     check(source_again != NULL, "source reopen failed");
