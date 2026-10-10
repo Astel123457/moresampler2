@@ -1,0 +1,22 @@
+
+expression_filter: true
+expressions:
+  gen: { name: Gender, abbr: gen, type: Numerical, min: -100, max: 100, default_value: 0, is_flag: true, flag: g }
+  mten: { name: Tension, abbr: mten, type: Numerical, min: -100, max: 100, default_value: 0, is_flag: true, flag: Mt }
+  mbr: { name: Breathiness, abbr: mbr, type: Numerical, min: -100, max: 100, default_value: 0, is_flag: true, flag: Mb }
+  mdry: { name: Dryness, abbr: mdry, type: Numerical, min: -100, max: 100, default_value: 0, is_flag: true, flag: Md }
+  mopn: { name: Mouth opening, abbr: mopn, type: Numerical, min: -100, max: 100, default_value: 0, is_flag: true, flag: Mo }
+  mfrm: { name: Formant emphasis, abbr: mfrm, type: Numerical, min: -100, max: 100, default_value: 0, is_flag: true, flag: ME }
+  msfm: { name: Singer formant, abbr: msfm, type: Numerical, min: -100, max: 100, default_value: 0, is_flag: true, flag: Mr }
+  mgrw: { name: Growl, abbr: mgrw, type: Numerical, min: 0, max: 100, default_value: 0, is_flag: true, flag: MG }
+  mcrs: { name: Growl coarseness, abbr: mcrs, type: Numerical, min: 0, max: 100, default_value: 0, is_flag: true, flag: MC }
+  mdst: { name: Distortion, abbr: mdst, type: Numerical, min: 0, max: 100, default_value: 0, is_flag: true, flag: MD }
+  mprn: { name: Pitch randomness, abbr: mprn, type: Numerical, min: 0, max: 100, default_value: 0, is_flag: true, flag: Mp }
+  muvc: { name: Unvoiced emphasis, abbr: muvc, type: Numerical, min: -20, max: 100, default_value: 0, is_flag: true, flag: b }
+  mamp: { name: Pitch-linked amplitude, abbr: mamp, type: Numerical, min: -100, max: 100, default_value: 0, is_flag: true, flag: A }
+  msta: { name: Stabilization, abbr: msta, type: Numerical, min: 0, max: 10, default_value: 0, is_flag: true, flag: Ms }
+  msy: { name: Noise suppression, abbr: msy, type: Numerical, min: 0, max: 100, default_value: 100, is_flag: true, flag: Y }
+  mpk: { name: Peak normalization, abbr: mpk, type: Numerical, min: 0, max: 100, default_value: 0, is_flag: true, flag: P }
+
+files:
+- .llsm2

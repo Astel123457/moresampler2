@@ -1,6 +1,13 @@
 # moresampler2
 moresampler2, written in c, with libllsm2 support
 
+For regular OpenUtau CLASSIC use, place [`moresampler2.yaml`](moresampler2.yaml)
+beside the standalone `moresampler2.exe` (or `moresampler2` on Linux/macOS) in
+Resamplers, restart OpenUtau, and select it in CLASSIC's track settings.
+This manifest exposes per-note flags without requiring an external-renderer API
+build or plugin DLL. If you rename the executable, rename the YAML to match its
+basename. It does not add renderer-only curves or analysis-generation controls.
+
 An optional managed bridge for OpenUtau's external-renderer discovery API is in
 [`OpenUtau/`](OpenUtau/). It embeds the native engine in one platform-specific
 DLL while preserving the standalone executable for normal resampler compatibility.

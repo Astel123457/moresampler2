@@ -154,9 +154,10 @@ jobs:
         run: |
           mkdir output
           Copy-Item build\Release\moresampler2.exe output\
+          Copy-Item moresampler2.yaml output\
           Copy-Item OpenUtau\bin\Release\net10.0\Moresampler2.OpenUtau.dll output\
           cd output
-          Compress-Archive -Path moresampler2.exe,Moresampler2.OpenUtau.dll -DestinationPath moresampler2-${{ matrix.os }}-${{ matrix.arch }}.zip
+          Compress-Archive -Path moresampler2.exe,moresampler2.yaml,Moresampler2.OpenUtau.dll -DestinationPath moresampler2-${{ matrix.os }}-${{ matrix.arch }}.zip
 
       - name: Package binary Non-Windows
         if: matrix.os != 'windows'
@@ -164,9 +165,10 @@ jobs:
         run: |
           mkdir output
           cp build/moresampler2 output/
+          cp moresampler2.yaml output/
           cp OpenUtau/bin/Release/net10.0/Moresampler2.OpenUtau.dll output/
           cd output
-          zip moresampler2-${{ matrix.os }}-${{ matrix.arch }}.zip moresampler2 Moresampler2.OpenUtau.dll
+          zip moresampler2-${{ matrix.os }}-${{ matrix.arch }}.zip moresampler2 moresampler2.yaml Moresampler2.OpenUtau.dll
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
